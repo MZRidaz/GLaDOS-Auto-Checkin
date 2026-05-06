@@ -96,6 +96,9 @@ def main():
     lines = []
 
     for idx, cookie in enumerate(cookies, 1):
+        # 每个账号清空上一个账号留下的 Session Cookie，避免 Cookie 污染
+        session.cookies.clear()
+
         headers = dict(HEADERS_BASE)
         headers["cookie"] = cookie
 
@@ -130,15 +133,20 @@ def main():
             s = session.get(STATUS_URL, headers=headers, timeout=TIMEOUT)
             sj = safe_json(s).get("data") or {}
             email = sj.get("email", email)
-            if sj.get("leftDays") is not None:
-                days = f"{int(float(sj['leftDays']))} 天"
+            try:
+                if sj.get("leftDays") is not None:
+                    days = f"{int(float(sj['leftDays']))} 天"
+            except (ValueError, TypeError):
+                pass
 
-        except Exception:
+        except Exception as e:
             fail += 1
             status = "❌ 异常"
+            print(f"⚠️ 账号 {idx} 异常: {e}")
 
         lines.append(f"{idx}. {email} | {status} | P:{points} | 剩余:{days}")
-        time.sleep(random.uniform(1, 2))
+        if idx < len(cookies):
+            time.sleep(random.uniform(1, 2))
 
     title = f"GLaDOS 签到完成 ✅{ok} ❌{fail} 🔁{repeat}"
     content = "\n".join(lines)
