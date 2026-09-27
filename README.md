@@ -47,7 +47,12 @@
 3. 找到 `Application` → `Cookies` → `glados.cloud`
 4. 复制完整 Cookie 内容
 
-示例：
+示例（新旧两种格式均支持，推荐直接复制浏览器中的完整值）：
+```
+gld:sess=xxxxxx; gld:sess.sig=yyyyyy
+```
+
+或：
 ```
 koa:sess=xxxxxx; koa:sess.sig=yyyyyy
 ```
