@@ -51,6 +51,7 @@ MAX_DELAY = 2.0
 TELEGRAM_MAX_LENGTH = 4000
 TELEGRAM_TRUNCATE_LENGTH = 3990
 CONTENT_MAX_LENGTH = 3000  # 推送汇总内容统一长度上限，避免超长导致部分渠道发送失败（#4）
+LOG_SNIPPET_MAX_LENGTH = 200
 COOKIE_MASK_LENGTH = 10
 # 前后各显示 10 个字符，因此长度必须 > 2*COOKIE_MASK_LENGTH + 3 = 23 才能安全脱敏，
 # 设为 24 可避免 len∈[21,23] 时前后片段重叠导致几乎暴露完整 Cookie（M3）。
@@ -136,6 +137,49 @@ def mask_cookie(cookie: str) -> str:
     if not cookie or len(cookie) <= COOKIE_MIN_LENGTH:
         return "***"
     return f"{cookie[:COOKIE_MASK_LENGTH]}...{cookie[-COOKIE_MASK_LENGTH:]}"
+
+
+def cookie_fingerprint(cookie: str) -> str:
+    """生成 Cookie 指纹用于日志关联（不输出明文）。"""
+    if not cookie:
+        return "none"
+    return hashlib.sha256(cookie.encode("utf-8")).hexdigest()[:8]
+
+
+def _log_snippet(text: str, limit: int = LOG_SNIPPET_MAX_LENGTH) -> str:
+    """压缩并截断文本，避免日志过长。"""
+    if not text:
+        return ""
+    compact = re.sub(r"\s+", " ", text).strip()
+    if len(compact) <= limit:
+        return compact
+    return compact[:limit] + "...(已截断)"
+
+
+def summarize_request_exception(exc: Exception) -> str:
+    """提取请求异常上下文，便于排查。"""
+    if isinstance(exc, requests.exceptions.HTTPError):
+        resp = getattr(exc, "response", None)
+        req = getattr(resp, "request", None) if resp is not None else None
+        method = getattr(req, "method", "?")
+        url = getattr(resp, "url", getattr(req, "url", "?")) if resp is not None else "?"
+        status = getattr(resp, "status_code", "?") if resp is not None else "?"
+        ctype = resp.headers.get("Content-Type", "?") if resp is not None else "?"
+        body = _log_snippet(getattr(resp, "text", "") if resp is not None else "")
+        parts = [f"{type(exc).__name__}", f"{method} {url}", f"HTTP {status}", f"Content-Type={ctype}"]
+        if body:
+            parts.append(f"Body={body}")
+        if str(exc):
+            parts.append(f"Error={exc}")
+        return " | ".join(parts)
+    if isinstance(exc, requests.exceptions.RequestException):
+        req = getattr(exc, "request", None)
+        method = getattr(req, "method", "?") if req is not None else "?"
+        url = getattr(req, "url", "?") if req is not None else "?"
+        if str(exc):
+            return f"{type(exc).__name__} | {method} {url} | Error={exc}"
+        return f"{type(exc).__name__} | {method} {url}"
+    return f"{type(exc).__name__}: {exc}"
 
 
 def _escape_markdown(text: str) -> str:
@@ -225,8 +269,12 @@ def retry_on_failure(max_retries: int = MAX_RETRY, min_wait: float = RETRY_MIN_W
                     last_exception = e
                     if attempt < max_retries and is_retryable(e):
                         wait_time = min(min_wait * (2 ** attempt), max_wait)
-                        logger.warning("第 %d 次尝试失败: %s，%.1f秒后重试...",
-                                       attempt + 1, e, wait_time)
+                        logger.warning(
+                            "第 %d 次尝试失败: %s，%.1f秒后重试...",
+                            attempt + 1,
+                            summarize_request_exception(e),
+                            wait_time,
+                        )
                         time.sleep(wait_time)
                         continue
                     break  # 不可重试（如 4xx）直接退出
@@ -253,7 +301,14 @@ def _push_request(
         else:
             r = requests.post(url, data=data_payload, headers=headers, timeout=TIMEOUT)
         if not r.ok:
-            logger.warning("%s 推送失败: HTTP %d", name, r.status_code)
+            logger.warning(
+                "%s 推送失败: HTTP %d | URL=%s | Content-Type=%s | Body=%s",
+                name,
+                r.status_code,
+                r.url,
+                r.headers.get("Content-Type", "?"),
+                _log_snippet(r.text or ""),
+            )
             return False
         resp = safe_json(r)
         if success_check(resp, r):
@@ -270,7 +325,7 @@ def _push_request(
         logger.warning("%s 推送失败: %s", name, fail_msg)
         return False
     except Exception as e:  # noqa: BLE001
-        logger.warning("%s 推送异常: %s", name, e)
+        logger.warning("%s 推送异常: %s", name, summarize_request_exception(e))
         return False
 
 
@@ -485,7 +540,7 @@ def push_all(title: str, content: str) -> Tuple[int, int]:
             try:
                 ok_push = fn(title, content)
             except Exception as e:  # noqa: BLE001
-                logger.warning("%s 推送异常: %s", name, e)
+                logger.warning("%s 推送异常: %s", name, summarize_request_exception(e))
                 ok_push = False
             results.append((name, bool(ok_push)))
 
@@ -590,6 +645,7 @@ def checkin_account(
         elif result == "repeat":
             status = "🔄 已签到"
         else:
+            logger.warning("账号 %d 签到失败详情: code=%s, message=%s", index, code, _log_snippet(str(message)))
             status = f"❌ 失败({message})"
 
         # 2. 查询账号状态（剩余天数、邮箱）
@@ -600,7 +656,7 @@ def checkin_account(
             if data.get("leftDays") is not None:
                 days = f"{safe_int_str(data['leftDays'])} 天"
         except Exception as e:  # noqa: BLE001
-            logger.warning("账号 %d 状态查询失败: %s", index, e)
+            logger.warning("账号 %d 状态查询失败: %s", index, summarize_request_exception(e))
 
         # 3. 查询总积分（兼容顶层 points 与 data.points 两种返回结构，#1）
         try:
@@ -614,12 +670,8 @@ def checkin_account(
                     total_points_int = int(float(pts))
                 except (TypeError, ValueError):
                     total_points_int = None
-        except requests.exceptions.HTTPError as e:
-            resp = getattr(e, "response", None)
-            status_code = getattr(resp, "status_code", "?") if resp is not None else "?"
-            logger.warning("账号 %d 积分查询失败 (HTTP %s)", index, status_code)
         except Exception as e:  # noqa: BLE001
-            logger.warning("账号 %d 积分查询失败: %s", index, e)
+            logger.warning("账号 %d 积分查询失败: %s", index, summarize_request_exception(e))
 
         # 4. 积分兑换（#9，仅配置了 EXCHANGE_PLAN 时执行；默认关闭不影响现有功能）
         #    兑换独立于签到结果，但仅在成功查到积分后尝试；失败不影响签到状态/退出码。
@@ -648,10 +700,10 @@ def checkin_account(
                         logger.warning("账号 %d 积分兑换失败: %s", index, ex_msg)
                 except Exception as e:  # noqa: BLE001
                     exchange_status = f"⚠️ 兑换异常({type(e).__name__})"
-                    logger.warning("账号 %d 积分兑换异常: %s", index, e)
+                    logger.warning("账号 %d 积分兑换异常: %s", index, summarize_request_exception(e))
 
     except Exception as e:  # noqa: BLE001
-        logger.error("账号 %d 签到异常: %s", index, e)
+        logger.error("账号 %d 签到异常: %s", index, summarize_request_exception(e))
         status = f"❌ 异常({type(e).__name__})"
         result = "fail"
 
@@ -714,6 +766,7 @@ def main() -> int:
                 continue
 
             logger.info("正在处理账号 %d/%d...", idx, len(cookies))
+            logger.info("账号 %d Cookie 指纹: %s", idx, cookie_fingerprint(cookie))
             acc = checkin_account(session, cookie, idx, exchange_plan)
 
             if acc["result"] == "ok":
