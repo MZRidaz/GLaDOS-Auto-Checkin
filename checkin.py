@@ -527,17 +527,20 @@ def api_get(session: requests.Session, url: str, headers: Dict[str, str]) -> Dic
     return require_json(r)  # 非 JSON 响应抛异常进入重试（M1）
 
 
-@retry_on_failure()
 def exchange_request(session: requests.Session, headers: Dict[str, str], plan: str) -> Dict[str, Any]:
     """
-    执行积分兑换请求（带重试，#9 功能请求）。
+    执行积分兑换请求（#9 功能请求）。
 
     GLaDOS 兑换接口以表单形式提交 planType（plan100/plan200/plan500），
     响应 JSON 中 code==0 表示兑换成功。
+
+    注意：故意不加 @retry_on_failure —— 兑换是消耗积分的非幂等 POST，
+    若首次请求服务端已成功但响应丢失（读超时/连接重置），重试会导致重复扣积分。
+    失败仅记警告、不影响签到结果与退出码，无需重试兜底。
     """
     r = session.post(EXCHANGE_URL, headers=headers, data={"planType": plan}, timeout=TIMEOUT)
     r.raise_for_status()
-    return require_json(r)  # 非 JSON 响应抛异常进入重试（M1）
+    return require_json(r)
 
 
 def checkin_account(
