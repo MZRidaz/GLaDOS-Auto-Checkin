@@ -49,10 +49,12 @@
 
 示例：
 ```
-koa:sess=xxxxxx; koa:sess.sig=yyyyyy
+koa:sess=xxxxxx; koa:sess.sig=yyyyyy; gld:sess=zzzzzz; gld:sess.sig=wwwwww
 ```
 
-⚠️ **必须是完整的一整段**
+⚠️ **必须是完整的一整段，且必须同时包含 4 项**：`koa:sess`、`koa:sess.sig`、`gld:sess`、`gld:sess.sig`。
+
+> 🔴 **2026-09 重要变更**：GLaDOS 网站新增了 `gld:sess` / `gld:sess.sig` 两项会话 Cookie，旧的仅含 `koa:sess` 两项的 Cookie 已无法通过鉴权（接口返回 `没有权限`）。请重新登录并复制**完整四项** Cookie 更新到 Secrets。
 
 ---
 
@@ -148,6 +150,10 @@ cookie_账号3
 
 A: Cookie 有有效期，请重新登录获取最新 Cookie 并更新 Secrets。
 
+**Q: 日志显示"没有权限"？**
+
+A: 2026-09 起 GLaDOS 要求 Cookie 同时包含 `koa:sess`、`koa:sess.sig`、`gld:sess`、`gld:sess.sig` 四项。请重新登录 https://glados.cloud ，按 F12 在 `Application → Cookies` 中复制完整 Cookie（浏览器复制时会自动带上全部 4 项），更新 `COOKIES` Secrets 即可。
+
 **Q: Actions 被暂停了？**
 
 A: 项目内置每月空提交保活。如仍被暂停，手动触发一次 `workflow_dispatch`。
@@ -163,6 +169,15 @@ A: 可以，配置多个 Secrets 即可同时推送。
 ---
 
 ## 🔄 更新日志
+
+### v2.1.1
+
+**问题修复**
+- 适配 GLaDOS 2026-09 会话 Cookie 变更：Cookie 新增 `gld:sess` / `gld:sess.sig` 两项（与原 `koa:sess` 两项并存，共 4 项），缺失时接口返回 `{"code":-2,"message":"没有权限"}`（同 Devilstore/Glados-Railgun-checkin#37）
+- `validate_cookie` 改为校验完整 4 项字段，旧格式 Cookie 在本地即被拦截并提示重新获取
+- 签到返回"没有权限"时，推送与日志中附带 Cookie 更新指引
+
+---
 
 ### v2.1.0
 

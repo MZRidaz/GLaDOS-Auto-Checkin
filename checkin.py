@@ -57,6 +57,10 @@ COOKIE_MASK_LENGTH = 10
 COOKIE_MIN_LENGTH = 24
 # 重复签到判定关键词（L5：提升为模块级常量，便于维护/国际化）
 REPEAT_KEYWORDS = ("repeat", "already", "重复", "已签到", "签到过", "请勿")
+# GLaDOS 会话 Cookie 字段：2026-09 起由两对变为两代并存（旧 koa 对 + 新增 gld 对），
+# 新版鉴权要求同时携带 gld:sess / gld:sess.sig，仅旧 koa 对会被判定"没有权限"（code=-2）
+COOKIE_KOA_FIELDS = ("koa:sess", "koa:sess.sig")
+COOKIE_GLD_FIELDS = ("gld:sess", "gld:sess.sig")
 # 积分兑换计划（#9 功能请求）：消耗 points 积分兑换 days 天会员。
 # 仅当用户显式配置 EXCHANGE_PLAN 时才执行，默认不兑换，避免静默消耗积分。
 EXCHANGE_PLANS = {
@@ -169,15 +173,25 @@ def parse_earned_points(message: str) -> int:
 
 
 def validate_cookie(cookie: str) -> Tuple[bool, str]:
-    """验证 Cookie 是否包含必要字段（按 ; 拆分 key 精确校验，避免子串误判）"""
+    """
+    验证 Cookie 是否包含必要字段（按 ; 拆分 key 精确校验，避免子串误判）。
+
+    GLaDOS 2026-09 起 Cookie 新增 gld:sess / gld:sess.sig 两项（与旧 koa 对并存），
+    缺少新字段时签到接口返回 {"code":-2,"message":"没有权限"}，
+    此处提前拦截并给出可操作的提示（参照 Devilstore/Glados-Railgun-checkin#37）。
+    """
     if not cookie or not cookie.strip():
         return False, "Cookie 为空"
     cookie = cookie.strip()
     keys = {part.split("=", 1)[0].strip() for part in cookie.split(";") if part.strip()}
-    if "koa:sess" not in keys:
-        return False, "Cookie 缺少必要字段: koa:sess"
-    if "koa:sess.sig" not in keys:
-        return False, "Cookie 缺少必要字段: koa:sess.sig"
+    missing = [f for f in (*COOKIE_KOA_FIELDS, *COOKIE_GLD_FIELDS) if f not in keys]
+    if missing:
+        return False, (
+            "Cookie 缺少必要字段: "
+            + ", ".join(missing)
+            + "（请重新登录 glados.cloud 并复制完整 Cookie，"
+            "需同时包含 koa:sess、koa:sess.sig、gld:sess、gld:sess.sig 四项）"
+        )
     return True, ""
 
 
@@ -571,9 +585,18 @@ def checkin_account(
         j = checkin_request(session, headers)
         code = j.get("code", -2)
         message = j.get("message", "")
+        # GLaDOS 新增 gld 会话 Cookie 后，旧 Cookie 或会话不一致会返回 code=-2"没有权限"。
+        # 仅追加提示文案、不改 code，避免"没有权限"混入 REPEAT_KEYWORDS 后被误判为已签到
+        if code == -2 and "没有权限" in (message or ""):
+            message = (
+                f"{message}（Cookie 缺少 gld:sess/gld:sess.sig 或已失效，"
+                "请重新登录 glados.cloud 复制完整四项 Cookie 更新 Secrets）"
+            )
         # H1：GLaDOS 不返回 points 字段，从 message 文本解析本次获得积分
         earned = parse_earned_points(message)
         result = classify_checkin(code, message)
+        if result == "repeat" and code == -2:
+            result = "fail"  # "没有权限"中包含"请勿/请勿重复"类关键词时防误判兜底
 
         if result == "ok":
             status = f"✅ 成功 (+{earned}积分)"
