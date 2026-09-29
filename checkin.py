@@ -596,7 +596,7 @@ def checkin_account(
         earned = parse_earned_points(message)
         result = classify_checkin(code, message)
         if result == "repeat" and code == -2:
-            result = "fail"  # "没有权限"中包含"请勿/请勿重复"类关键词时防误判兜底
+            result = "fail"  # code=-2 的鉴权失败文案若命中重复签到关键词（如"请勿"），仍判失败
 
         if result == "ok":
             status = f"✅ 成功 (+{earned}积分)"
