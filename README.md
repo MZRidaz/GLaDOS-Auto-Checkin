@@ -47,14 +47,19 @@
 3. 找到 `Application` → `Cookies` → `glados.cloud`
 4. 复制完整 Cookie 内容
 
-示例：
+示例（不同浏览器 / 会话状态下看到的字段可能不同，以下样式均可用）：
 ```
 gld:sess=xxxxxx; gld:sess.sig=yyyyyy
 ```
 
-⚠️ **必须是完整的一整段，且 `sess` 与 `sess.sig` 必须成对出现**。2026-09 起新登录仅签发 `gld:sess` / `gld:sess.sig` 两项（直接复制浏览器里的 Cookie 即可）；旧版 `koa:sess` / `koa:sess.sig` 格式仍兼容。
+或（未重新登录的旧会话可能仍保留 koa 两项，四项并存同样兼容）：
+```
+koa:sess=xxxxxx; koa:sess.sig=yyyyyy; gld:sess=zzzzzz; gld:sess.sig=wwwwww
+```
 
-> 🔴 **2026-09 重要变更**：GLaDOS 会话 Cookie 前缀由 `koa:` 改为 `gld:`——重新登录后浏览器里**只有** `gld:sess`、`gld:sess.sig` 两项，旧的 `koa` 对不再出现（服务端已失效）。仅含旧 `koa` 对的 Cookie 签到时接口返回 `没有权限`，请重新登录并复制最新 Cookie 更新到 Secrets。
+⚠️ **必须是完整的一整段，且至少有一组同前缀的 `sess` 与 `sess.sig` 成对出现**。浏览器里有什么就复制什么——只有 `gld` 两项、或 `koa` + `gld` 四项并存都能直接用；仅含旧 `koa` 两项时脚本会放行但提示可能失效。
+
+> 🔴 **2026-09 重要变更**：GLaDOS 会话 Cookie 前缀由 `koa:` 改为 `gld:`，新登录通常只签发 `gld:sess` / `gld:sess.sig` 两项；旧会话在部分浏览器中可能仍保留 `koa` 两项（四项并存），一并复制即可。但仅含旧 `koa` 对的 Cookie 服务端已失效，签到接口返回 `没有权限`，此时请重新登录并复制最新 Cookie 更新到 Secrets。
 >
 > 💡 脚本按「`X:sess` 与 `X:sess.sig` 同前缀成对」做结构校验，不绑定具体前缀；整段误带 `Cookie:` 头前缀或包裹引号也会被自动清理。
 
@@ -155,7 +160,7 @@ A: Cookie 有有效期，请重新登录获取最新 Cookie 并更新 Secrets。
 
 **Q: 日志显示"没有权限"或"鉴权失败"？**
 
-A: 2026-09 起 GLaDOS 会话 Cookie 改为签发 `gld:sess` / `gld:sess.sig` 两项（旧 `koa` 对已失效），仅含旧 Cookie 时接口返回 `{"code":-2,"message":"没有权限"}`。请重新登录 https://glados.cloud ，按 F12 在 `Application → Cookies` 中复制完整 Cookie（现为新 `gld` 两项），更新 `COOKIES` Secrets 即可。
+A: 2026-09 起 GLaDOS 会话 Cookie 改为签发 `gld:sess` / `gld:sess.sig` 两项（旧 `koa` 对已失效），仅含旧 Cookie 时接口返回 `{"code":-2,"message":"没有权限"}`。请重新登录 https://glados.cloud ，按 F12 在 `Application → Cookies` 中复制完整 Cookie（通常为新 `gld` 两项；若同时看到旧 `koa` 两项，一并复制即可），更新 `COOKIES` Secrets 即可。
 
 **Q: Actions 被暂停了？**
 
@@ -177,7 +182,7 @@ A: 可以，配置多个 Secrets 即可同时推送。
 
 **问题修复**
 - 修正 v2.1.1 对 Cookie 变更的错误适配：2026-09 实际变更是**前缀替换**（`koa:` → `gld:`），新登录后浏览器中仅有 `gld:sess` / `gld:sess.sig` 两项，并非"新旧两对并存共 4 项"；v2.1.1 要求四项齐全导致新格式 Cookie 被本地校验误拒
-- `validate_cookie` 重写为前缀无关的结构校验：`X:sess` 与 `X:sess.sig` 同前缀成对即通过（`gld`/`koa`/未来再改名均兼容），仅含旧 `koa` 对时放行但告警
+- `validate_cookie` 重写为前缀无关的结构校验：`X:sess` 与 `X:sess.sig` 同前缀成对即通过（`gld`/`koa`/未来再改名均兼容），仅含旧 `koa` 对时放行但告警；浏览器中仅 `gld` 两项、或 `koa` + `gld` 四项并存的 Cookie 均可直接使用
 - 新增 `normalize_cookie`：自动清理误粘贴的 `Cookie:` 头前缀、包裹引号与多余空白（多账号拆分前逐段处理）
 
 **优化改进**
