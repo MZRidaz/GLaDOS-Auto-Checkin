@@ -57,10 +57,19 @@ COOKIE_MASK_LENGTH = 10
 COOKIE_MIN_LENGTH = 24
 # 重复签到判定关键词（L5：提升为模块级常量，便于维护/国际化）
 REPEAT_KEYWORDS = ("repeat", "already", "重复", "已签到", "签到过", "请勿")
-# GLaDOS 会话 Cookie 字段：2026-09 起由两对变为两代并存（旧 koa 对 + 新增 gld 对），
-# 新版鉴权要求同时携带 gld:sess / gld:sess.sig，仅旧 koa 对会被判定"没有权限"（code=-2）
-COOKIE_KOA_FIELDS = ("koa:sess", "koa:sess.sig")
-COOKIE_GLD_FIELDS = ("gld:sess", "gld:sess.sig")
+# GLaDOS 会话 Cookie 字段：2026-09 起新登录仅签发 gld:sess / gld:sess.sig 一对
+# （旧 koa:sess / koa:sess.sig 会话随之失效，浏览器中已不再出现 koa 对）。
+# 因此校验按"结构"而非具体前缀：X:sess 与 X:sess.sig 必须同前缀成对出现，
+# 前缀本身不限定（gld / koa / 未来再改名均可），避免站点再变更前缀时脚本失效。
+SESSION_KEY_RE = re.compile(r"^(?P<prefix>[A-Za-z0-9_.-]+):sess$")
+SESSION_SIG_RE = re.compile(r"^(?P<prefix>[A-Za-z0-9_.-]+):sess\.sig$")
+COOKIE_FORMAT_HINT = (
+    "期望格式：gld:sess=xxx; gld:sess.sig=yyy（现网签发，sess 与 sess.sig 必须成对），"
+    "旧版 koa:sess=xxx; koa:sess.sig=yyy 亦兼容。"
+    "获取：登录 https://glados.cloud → F12 → Application → Cookies → 复制完整 Cookie 值"
+)
+# 服务端鉴权失败关键词（小写匹配）：Cookie 缺失/失效/会话过期时接口返回"没有权限"等文案
+AUTH_FAIL_KEYWORDS = ("没有权限", "权限不足", "未登录", "登录已失效", "登录失效", "unauthorized", "forbidden")
 # 积分兑换计划（#9 功能请求）：消耗 points 积分兑换 days 天会员。
 # 仅当用户显式配置 EXCHANGE_PLAN 时才执行，默认不兑换，避免静默消耗积分。
 EXCHANGE_PLANS = {
@@ -172,27 +181,80 @@ def parse_earned_points(message: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+def normalize_cookie(cookie: Optional[str]) -> str:
+    """
+    规整用户粘贴的 Cookie（不改动字段内容与顺序）：
+
+    - 去首尾空白；
+    - 去误粘贴的请求头前缀 "Cookie:"（F12 网络面板整行复制时常见）；
+    - 去包裹整段的成对引号（可多层，如浏览器扩展导出的带引号格式）。
+    """
+    if not cookie:
+        return ""
+    c = cookie.strip()
+    # 引号与前缀可能交替嵌套（如 "Cookie: 'xxx'"），循环处理直到不再变化
+    changed = True
+    while changed:
+        changed = False
+        if c[:7].lower() == "cookie:":
+            c = c[7:].strip()
+            changed = True
+        while len(c) >= 2 and c[0] == c[-1] and c[0] in ("\"", "'"):
+            c = c[1:-1].strip()
+            changed = True
+    return c
+
+
+def parse_session_prefixes(cookie: str) -> Dict[str, Dict[str, bool]]:
+    """
+    按 ; 拆分 Cookie 键值对，统计各前缀的 sess / sess.sig 出现情况。
+
+    返回 {前缀: {"sess": bool, "sig": bool}}，仅包含命中 X:sess 或 X:sess.sig 的键；
+    其它键（如 lang、theme 等）忽略。sig 正则先于 sess 判断（防御性，$ 锚点下二者互斥）。
+    """
+    groups: Dict[str, Dict[str, bool]] = {}
+    for part in cookie.split(";"):
+        key = part.split("=", 1)[0].strip()
+        if not key:
+            continue
+        m = SESSION_SIG_RE.match(key)
+        if m:
+            groups.setdefault(m.group("prefix"), {"sess": False, "sig": False})["sig"] = True
+            continue
+        m = SESSION_KEY_RE.match(key)
+        if m:
+            groups.setdefault(m.group("prefix"), {"sess": False, "sig": False})["sess"] = True
+    return groups
+
+
 def validate_cookie(cookie: str) -> Tuple[bool, str]:
     """
-    验证 Cookie 是否包含必要字段（按 ; 拆分 key 精确校验，避免子串误判）。
+    结构化校验 Cookie：存在某个前缀的 X:sess 与 X:sess.sig 同前缀成对即视为格式有效。
 
-    GLaDOS 2026-09 起 Cookie 新增 gld:sess / gld:sess.sig 两项（与旧 koa 对并存），
-    缺少新字段时签到接口返回 {"code":-2,"message":"没有权限"}，
-    此处提前拦截并给出可操作的提示（参照 Devilstore/Glados-Railgun-checkin#37）。
+    GLaDOS 2026-09 起新登录仅签发 gld:sess / gld:sess.sig 一对（旧 koa 对不再出现，
+    旧 koa 会话在服务端已失效，签到接口返回 {"code":-2,"message":"没有权限"}），
+    故不绑定具体前缀，仅要求成对；仅含旧 koa 对时放行但告警，由服务端最终裁决。
     """
-    if not cookie or not cookie.strip():
-        return False, "Cookie 为空"
-    cookie = cookie.strip()
-    keys = {part.split("=", 1)[0].strip() for part in cookie.split(";") if part.strip()}
-    missing = [f for f in (*COOKIE_KOA_FIELDS, *COOKIE_GLD_FIELDS) if f not in keys]
-    if missing:
+    c = normalize_cookie(cookie)
+    if not c:
+        return False, f"Cookie 为空。{COOKIE_FORMAT_HINT}"
+    groups = parse_session_prefixes(c)
+    complete = sorted(p for p, f in groups.items() if f["sess"] and f["sig"])
+    if complete:
+        if "gld" not in complete and "koa" in complete:
+            logger.warning(
+                "检测到仅含旧版 koa: 会话对：新登录已不再签发 koa 对，该 Cookie 可能已失效，"
+                "建议重新登录 glados.cloud 获取 gld: 会话 Cookie"
+            )
+        return True, ""
+    actual = ", ".join(sorted(groups)) or "（未解析到任何 :sess / :sess.sig 字段）"
+    incomplete = sorted(p for p, f in groups.items() if f["sess"] != f["sig"])
+    if incomplete:
         return False, (
-            "Cookie 缺少必要字段: "
-            + ", ".join(missing)
-            + "（请重新登录 glados.cloud 并复制完整 Cookie，"
-            "需同时包含 koa:sess、koa:sess.sig、gld:sess、gld:sess.sig 四项）"
+            f"Cookie 会话字段不成对：前缀 {incomplete} 缺少 sess 或 sess.sig；"
+            f"实际解析到: {actual}。{COOKIE_FORMAT_HINT}"
         )
-    return True, ""
+    return False, f"Cookie 缺少 X:sess / X:sess.sig 成对字段；实际解析到: {actual}。{COOKIE_FORMAT_HINT}"
 
 
 def is_retryable(exc: Exception) -> bool:
@@ -525,6 +587,12 @@ def classify_checkin(code: Any, message: str) -> str:
     return "fail"
 
 
+def is_auth_failure(message: str) -> bool:
+    """判断响应文案是否为 Cookie 鉴权失败（缺失/失效/会话过期）。"""
+    msg = (message or "").lower()
+    return any(kw in msg for kw in AUTH_FAIL_KEYWORDS)
+
+
 @retry_on_failure()
 def checkin_request(session: requests.Session, headers: Dict[str, str]) -> Dict[str, Any]:
     """执行签到请求（带重试）"""
@@ -568,6 +636,7 @@ def checkin_account(
     exchange_plan: 积分兑换计划名（plan100/plan200/plan500），为 None 时不兑换。
     """
     session.cookies.clear()  # 清除上一个账号的残留 Cookie，避免串扰
+    cookie = normalize_cookie(cookie)
     headers = {**HEADERS_BASE}
     headers["cookie"] = cookie
 
@@ -585,13 +654,6 @@ def checkin_account(
         j = checkin_request(session, headers)
         code = j.get("code", -2)
         message = j.get("message", "")
-        # GLaDOS 新增 gld 会话 Cookie 后，旧 Cookie 或会话不一致会返回 code=-2"没有权限"。
-        # 仅追加提示文案、不改 code，避免"没有权限"混入 REPEAT_KEYWORDS 后被误判为已签到
-        if code == -2 and "没有权限" in (message or ""):
-            message = (
-                f"{message}（Cookie 缺少 gld:sess/gld:sess.sig 或已失效，"
-                "请重新登录 glados.cloud 复制完整四项 Cookie 更新 Secrets）"
-            )
         # H1：GLaDOS 不返回 points 字段，从 message 文本解析本次获得积分
         earned = parse_earned_points(message)
         result = classify_checkin(code, message)
@@ -602,6 +664,8 @@ def checkin_account(
             status = f"✅ 成功 (+{earned}积分)"
         elif result == "repeat":
             status = "🔄 已签到"
+        elif is_auth_failure(message):
+            status = f"❌ 鉴权失败({message}) → 请重新登录 glados.cloud 获取最新 Cookie 更新 Secrets"
         else:
             status = f"❌ 失败({message})"
 
@@ -682,8 +746,9 @@ def checkin_account(
 # ==================== 主流程 ====================
 def main() -> int:
     # H2：支持 ||| 或换行(\n)或 & 分隔多账号 Cookie；推荐使用 ||| 避免与 Cookie 值冲突
+    # 逐段 normalize_cookie：容忍误粘贴的 "Cookie:" 前缀、包裹引号与多余空白
     raw = os.getenv("COOKIES", "")
-    cookies = [c.strip() for c in re.split(r"\|\|\||[&\n]", raw) if c.strip()]
+    cookies = [c for c in (normalize_cookie(x) for x in re.split(r"\|\|\||[&\n]", raw)) if c]
 
     # #9：积分兑换计划（可选，默认关闭；仅显式配置且值合法时启用，避免静默消耗积分）
     raw_plan = (os.getenv("EXCHANGE_PLAN") or os.getenv("GLADOS_EXCHANGE_PLAN") or "").strip()

@@ -49,12 +49,14 @@
 
 示例：
 ```
-koa:sess=xxxxxx; koa:sess.sig=yyyyyy; gld:sess=zzzzzz; gld:sess.sig=wwwwww
+gld:sess=xxxxxx; gld:sess.sig=yyyyyy
 ```
 
-⚠️ **必须是完整的一整段，且必须同时包含 4 项**：`koa:sess`、`koa:sess.sig`、`gld:sess`、`gld:sess.sig`。
+⚠️ **必须是完整的一整段，且 `sess` 与 `sess.sig` 必须成对出现**。2026-09 起新登录仅签发 `gld:sess` / `gld:sess.sig` 两项（直接复制浏览器里的 Cookie 即可）；旧版 `koa:sess` / `koa:sess.sig` 格式仍兼容。
 
-> 🔴 **2026-09 重要变更**：GLaDOS 网站新增了 `gld:sess` / `gld:sess.sig` 两项会话 Cookie，旧的仅含 `koa:sess` 两项的 Cookie 已无法通过鉴权（接口返回 `没有权限`）。请重新登录并复制**完整四项** Cookie 更新到 Secrets。
+> 🔴 **2026-09 重要变更**：GLaDOS 会话 Cookie 前缀由 `koa:` 改为 `gld:`——重新登录后浏览器里**只有** `gld:sess`、`gld:sess.sig` 两项，旧的 `koa` 对不再出现（服务端已失效）。仅含旧 `koa` 对的 Cookie 签到时接口返回 `没有权限`，请重新登录并复制最新 Cookie 更新到 Secrets。
+>
+> 💡 脚本按「`X:sess` 与 `X:sess.sig` 同前缀成对」做结构校验，不绑定具体前缀；整段误带 `Cookie:` 头前缀或包裹引号也会被自动清理。
 
 ---
 
@@ -141,6 +143,7 @@ cookie_账号3
 | ✅ 成功 | 签到成功，显示获得积分 |
 | 🔄 已签到 | 今日已签到过 |
 | ❌ 失败 | 签到失败，显示原因 |
+| ❌ 鉴权失败 | Cookie 失效或格式不完整（如缺少 `gld:` 会话对），请重新登录获取 |
 
 ---
 
@@ -150,9 +153,9 @@ cookie_账号3
 
 A: Cookie 有有效期，请重新登录获取最新 Cookie 并更新 Secrets。
 
-**Q: 日志显示"没有权限"？**
+**Q: 日志显示"没有权限"或"鉴权失败"？**
 
-A: 2026-09 起 GLaDOS 要求 Cookie 同时包含 `koa:sess`、`koa:sess.sig`、`gld:sess`、`gld:sess.sig` 四项。请重新登录 https://glados.cloud ，按 F12 在 `Application → Cookies` 中复制完整 Cookie（浏览器复制时会自动带上全部 4 项），更新 `COOKIES` Secrets 即可。
+A: 2026-09 起 GLaDOS 会话 Cookie 改为签发 `gld:sess` / `gld:sess.sig` 两项（旧 `koa` 对已失效），仅含旧 Cookie 时接口返回 `{"code":-2,"message":"没有权限"}`。请重新登录 https://glados.cloud ，按 F12 在 `Application → Cookies` 中复制完整 Cookie（现为新 `gld` 两项），更新 `COOKIES` Secrets 即可。
 
 **Q: Actions 被暂停了？**
 
@@ -169,6 +172,18 @@ A: 可以，配置多个 Secrets 即可同时推送。
 ---
 
 ## 🔄 更新日志
+
+### v2.1.2
+
+**问题修复**
+- 修正 v2.1.1 对 Cookie 变更的错误适配：2026-09 实际变更是**前缀替换**（`koa:` → `gld:`），新登录后浏览器中仅有 `gld:sess` / `gld:sess.sig` 两项，并非"新旧两对并存共 4 项"；v2.1.1 要求四项齐全导致新格式 Cookie 被本地校验误拒
+- `validate_cookie` 重写为前缀无关的结构校验：`X:sess` 与 `X:sess.sig` 同前缀成对即通过（`gld`/`koa`/未来再改名均兼容），仅含旧 `koa` 对时放行但告警
+- 新增 `normalize_cookie`：自动清理误粘贴的 `Cookie:` 头前缀、包裹引号与多余空白（多账号拆分前逐段处理）
+
+**优化改进**
+- 签到返回鉴权类失败（`没有权限`/`unauthorized` 等）时，状态行明确标注"鉴权失败"并提示重新获取 Cookie，与普通业务失败区分
+
+---
 
 ### v2.1.1
 
