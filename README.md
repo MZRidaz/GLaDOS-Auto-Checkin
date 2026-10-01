@@ -47,12 +47,18 @@
 3. 找到 `Application` → `Cookies` → `glados.cloud`
 4. 复制完整 Cookie 内容
 
-示例：
+示例（官网当前签发的是 `gld:` 前缀）：
 ```
-koa:sess=xxxxxx; koa:sess.sig=yyyyyy
+gld:sess=xxxxxx; gld:sess.sig=yyyyyy
 ```
 
-⚠️ **必须是完整的一整段**
+老版本签发的 `koa:sess=xxxxxx; koa:sess.sig=yyyyyy` 同样支持，两种前缀任选其一。
+
+⚠️ **必须是完整的一整段**，且 `sess` 与 `sess.sig` 两个字段**必须同时存在、前缀一致**。
+只复制其中一个会导致签到失败（脚本会明确指出缺少哪个字段）。
+
+> 💡 两种前缀无需手动转换。脚本会自动识别实际传入的键名，
+> **不要把 `gld:` 改成 `koa:`** —— 改前缀会让服务端无法识别 session，导致「没有权限」。
 
 ---
 
@@ -60,12 +66,15 @@ koa:sess=xxxxxx; koa:sess.sig=yyyyyy
 
 进入你 Fork 后的仓库：
 
-1. **Settings** → **Secrets and variables** → **Actions**
+1. **Settings** → **Secrets and variables** → **Actions** → **Secrets** 标签页
 2. 点击 **New repository secret**
 3. 添加：
    - **Name**：`COOKIES`
    - **Value**：粘贴刚才复制的 Cookie
 4. 点击 **Save**
+
+⚠️ **必须填在 Secrets，不是 Variables。** 填错位置脚本会读不到值，直接报
+`未检测到 COOKIES`。变量名必须是 `COOKIES`，不能有多余空格。
 
 ---
 
@@ -123,6 +132,29 @@ cookie_账号3
 ```
 
 ⚠️ Cookie 值本身不得包含 `|||`、`&` 或换行符，否则会被错误拆分。推荐使用 `|||` 作为分隔符，因为 Cookie 值中几乎不可能出现该字符串。
+
+---
+
+## 💻 本地运行
+
+不依赖 GitHub Actions 也能直接跑：
+
+```bash
+pip install "requests==2.32.3"
+
+# Windows PowerShell
+$env:COOKIES="gld:sess=xxxxxx; gld:sess.sig=yyyyyy"
+python checkin.py
+
+# Linux / macOS
+export COOKIES="gld:sess=xxxxxx; gld:sess.sig=yyyyyy"
+python checkin.py
+```
+
+多账号用 `|||` 分隔：`cookie1 ||| cookie2`（`&` 或换行也可以）。
+
+退出码含义：`0` = 至少一个账号签到成功或今日已签到；
+`1` = 全部账号失败，或未配置 `COOKIES`（非零退出码便于在 CI 中及时发现问题）。
 
 ---
 
