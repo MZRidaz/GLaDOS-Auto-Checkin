@@ -57,6 +57,22 @@ COOKIE_MASK_LENGTH = 10
 COOKIE_MIN_LENGTH = 24
 # 重复签到判定关键词（L5：提升为模块级常量，便于维护/国际化）
 REPEAT_KEYWORDS = ("repeat", "already", "重复", "已签到", "签到过", "请勿")
+# Cookie 会话字段的「结构」正则：任意前缀 + sess / sess.sig。
+# GLaDOS 早期使用 koa:sess，现网改签发 gld:sess；未来还可能再改名。
+# 因此校验「不认名字、只认结构」——只要存在 <任意前缀>:sess 与同前缀 :sess.sig 成对即通过，
+# 前缀改名时无需改动任何代码（一劳永逸）。
+_SESS_KEY_RE = re.compile(r"^(?P<prefix>[A-Za-z0-9_.-]+):sess$")
+_SIG_KEY_RE = re.compile(r"^(?P<prefix>[A-Za-z0-9_.-]+):sess\.sig$")
+# 服务端鉴权失败关键词：命中说明 Cookie 已失效/复制不完整，而非格式问题，
+# 需与「格式校验失败」区分，给出「重新获取 Cookie」的可操作提示。
+AUTH_FAIL_KEYWORDS = ("没有权限", "权限不足", "未登录", "登录已失效", "unauthorized", "forbidden", "invalid token")
+# Cookie 缺失/不合法时统一输出的期望格式说明（便于用户自查与在日志中直接定位）
+COOKIE_FORMAT_HINT = (
+    "期望 Cookie 格式（前缀任意，sess 与 sess.sig 必须成对出现）:\n"
+    "  gld:sess=xxxxxx; gld:sess.sig=yyyyyy   （现网签发）\n"
+    "  koa:sess=xxxxxx; koa:sess.sig=yyyyyy   （旧版签发）\n"
+    "获取方式：登录 https://glados.cloud → F12 → Application → Cookies → 复制完整 Cookie 值"
+)
 # 积分兑换计划（#9 功能请求）：消耗 points 积分兑换 days 天会员。
 # 仅当用户显式配置 EXCHANGE_PLAN 时才执行，默认不兑换，避免静默消耗积分。
 EXCHANGE_PLANS = {
@@ -168,17 +184,77 @@ def parse_earned_points(message: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+def normalize_cookie(cookie: str) -> str:
+    """
+    归一化用户粘贴的 Cookie（不改变语义，只清理复制过程中混入的杂质）：
+
+      - 首尾空白；
+      - 首尾多余的引号（从 JSON/配置文件复制时常见，可能多层嵌套）；
+      - 误带的请求头名前缀 "Cookie:"（从开发者工具 Request Headers 整行复制时常见）。
+
+    注意：不会改写 koa:/gld: 等前缀，也不会重排字段，避免破坏可正常使用的 Cookie。
+    """
+    c = (cookie or "").strip()
+    while len(c) >= 2 and c[0] == c[-1] and c[0] in ('"', "'"):
+        c = c[1:-1].strip()
+    if c[:7].lower() == "cookie:":
+        c = c[7:].strip()
+    return c
+
+
+def parse_session_prefixes(cookie: str) -> Dict[str, Dict[str, bool]]:
+    """
+    解析 Cookie 中的会话字段，返回 {前缀: {"sess": bool, "sig": bool}}。
+
+    按 ; 拆分后对键名做精确正则匹配（<prefix>:sess / <prefix>:sess.sig），
+    不依赖任何单一硬编码前缀，因此 koa:/gld:/未来任意前缀天然兼容。
+    """
+    found: Dict[str, Dict[str, bool]] = {}
+    for part in (cookie or "").split(";"):
+        key = part.strip().split("=", 1)[0].strip()
+        if not key:
+            continue
+        # 先匹配 .sig 再匹配 sess，避免 "xxx:sess.sig" 被 :sess 误判
+        m_sig = _SIG_KEY_RE.match(key)
+        if m_sig:
+            found.setdefault(m_sig.group("prefix"), {}).setdefault("sig", True)
+            continue
+        m_sess = _SESS_KEY_RE.match(key)
+        if m_sess:
+            found.setdefault(m_sess.group("prefix"), {}).setdefault("sess", True)
+    return found
+
+
+def extract_session_prefix(cookie: str) -> Optional[str]:
+    """返回 Cookie 中「sess 与 sess.sig 成对」的会话前缀；无有效成对前缀时返回 None。"""
+    for prefix, flags in parse_session_prefixes(cookie).items():
+        if flags.get("sess") and flags.get("sig"):
+            return prefix
+    return None
+
+
 def validate_cookie(cookie: str) -> Tuple[bool, str]:
-    """验证 Cookie 是否包含必要字段（按 ; 拆分 key 精确校验，避免子串误判）"""
-    if not cookie or not cookie.strip():
-        return False, "Cookie 为空"
-    cookie = cookie.strip()
-    keys = {part.split("=", 1)[0].strip() for part in cookie.split(";") if part.strip()}
-    if "koa:sess" not in keys:
-        return False, "Cookie 缺少必要字段: koa:sess"
-    if "koa:sess.sig" not in keys:
-        return False, "Cookie 缺少必要字段: koa:sess.sig"
-    return True, ""
+    """
+    验证 Cookie 是否为合法的 GLaDOS 会话（结构校验，前缀无关）。
+
+    判据：存在任意前缀 P，使得 P:sess 与 P:sess.sig 同时存在且前缀一致。
+    这样 koa:/gld:/未来任意前缀均自动通过，改名不再需要改代码。
+    校验失败时返回的信息会点名「实际解析到的键名」，并附期望格式，便于快速定位。
+    """
+    cookie = normalize_cookie(cookie)
+    if not cookie:
+        return False, f"Cookie 为空。{COOKIE_FORMAT_HINT}"
+    groups = parse_session_prefixes(cookie)
+    # 收集成对 / 不成对的前缀，用于生成可诊断的错误信息
+    complete, incomplete = [], []
+    for prefix, flags in groups.items():
+        (complete if (flags.get("sess") and flags.get("sig")) else incomplete).append(prefix)
+    if complete:
+        return True, ""
+    actual = ", ".join(sorted(groups.keys())) or "（未解析到任何 :sess / :sess.sig 字段）"
+    if incomplete:
+        return False, f"Cookie 会话字段不成对：前缀 {incomplete} 缺少 sess 或 sess.sig；实际键名: {actual}。{COOKIE_FORMAT_HINT}"
+    return False, f"Cookie 缺少 <前缀>:sess 与 <前缀>:sess.sig 字段；实际键名: {actual}。{COOKIE_FORMAT_HINT}"
 
 
 def is_retryable(exc: Exception) -> bool:
@@ -580,7 +656,13 @@ def checkin_account(
         elif result == "repeat":
             status = "🔄 已签到"
         else:
-            status = f"❌ 失败({message})"
+            # 区分「服务端鉴权失败」与「其它业务失败」：鉴权失败通常是 Cookie 过期/
+            # 复制不完整，需要给出「重新获取 Cookie」的可操作提示，避免与格式问题混淆。
+            if any(kw in (message or "").lower() for kw in AUTH_FAIL_KEYWORDS):
+                status = f"❌ 鉴权失败({message}) → 请重新获取 Cookie"
+                logger.warning("账号 %d 鉴权失败，Cookie 可能已过期或复制不完整: %s", index, message)
+            else:
+                status = f"❌ 失败({message})"
 
         # 2. 查询账号状态（剩余天数、邮箱）
         try:
@@ -660,7 +742,8 @@ def checkin_account(
 def main() -> int:
     # H2：支持 ||| 或换行(\n)或 & 分隔多账号 Cookie；推荐使用 ||| 避免与 Cookie 值冲突
     raw = os.getenv("COOKIES", "")
-    cookies = [c.strip() for c in re.split(r"\|\|\||[&\n]", raw) if c.strip()]
+    # 先归一化（剥离空白/引号/"Cookie:" 头名）再过滤空串，避免粘贴杂质导致误判
+    cookies = [c for c in (normalize_cookie(x) for x in re.split(r"\|\|\||[&\n]", raw)) if c]
 
     # #9：积分兑换计划（可选，默认关闭；仅显式配置且值合法时启用，避免静默消耗积分）
     raw_plan = (os.getenv("EXCHANGE_PLAN") or os.getenv("GLADOS_EXCHANGE_PLAN") or "").strip()
@@ -702,6 +785,9 @@ def main() -> int:
                 if idx < len(cookies):
                     time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
                 continue
+
+            # 自诊断：打印识别到的会话前缀（前缀改名时一眼可见，不用翻日志）
+            logger.info("账号 %d 会话前缀识别为: %s:", idx, extract_session_prefix(cookie))
 
             logger.info("正在处理账号 %d/%d...", idx, len(cookies))
             acc = checkin_account(session, cookie, idx, exchange_plan)
