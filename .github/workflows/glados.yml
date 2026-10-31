@@ -33,7 +33,7 @@ jobs:
       - name: Run checkin
         run: python checkin.py
         env:
-          COOKIES: ${{ secrets.COOKIES }}
+          COOKIES: ${{ secrets.COOKIES || vars.COOKIES }}
           SENDKEY: ${{ secrets.SENDKEY }}
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
