@@ -3,14 +3,14 @@ name: GLaDOS Auto Checkin
 on:
   workflow_dispatch:  # 手动触发
   schedule:
-    - cron: '0 4 * * *'   # 每日 UTC 4 点签到（北京时间 12 点）
+    - cron: '17 1 * * *'  # 每日 UTC 1:17 签到（北京时间 9:17）
     - cron: '0 0 1 * *'   # 每月 1 号保活空提交
 
 jobs:
   checkin:
     name: GLaDOS 签到
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     if: github.event_name != 'schedule' || github.event.schedule != '0 0 1 * *'
     concurrency:
       group: glados-checkin
@@ -18,6 +18,9 @@ jobs:
 
     permissions:
       contents: read
+
+    env:
+      GLADOS_EMAILS: ${{ secrets.GLADOS_EMAILS }}
 
     steps:
       - uses: actions/checkout@v4
@@ -28,12 +31,30 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install "requests==2.32.3" --no-cache-dir
+        run: pip install -r requirements.txt --no-cache-dir
+
+      - name: Run offline tests
+        run: python -m unittest discover -s tests -v
+
+      # 缓存中只有 Fernet 密文，解密密钥仅在签到步骤通过 Secrets 提供。
+      - name: Restore encrypted cookies
+        if: env.GLADOS_EMAILS != ''
+        uses: actions/cache/restore@v4
+        with:
+          path: .glados/cookies.enc
+          key: glados-cookies-v1-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            glados-cookies-v1-${{ github.ref_name }}-
 
       - name: Run checkin
         run: python checkin.py
         env:
           COOKIES: ${{ secrets.COOKIES || vars.COOKIES }}
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          COOKIE_STORE_KEY: ${{ secrets.COOKIE_STORE_KEY }}
+          GMAIL_FROM: ${{ secrets.GMAIL_FROM }}
+          GMAIL_WAIT_SECONDS: ${{ vars.GMAIL_WAIT_SECONDS || '120' }}
           SENDKEY: ${{ secrets.SENDKEY }}
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
@@ -50,6 +71,14 @@ jobs:
           # #9 积分兑换计划（可选；不配置则默认不兑换，不影响现有签到）
           EXCHANGE_PLAN: ${{ secrets.EXCHANGE_PLAN }}
           GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
+
+      # 即使某个账号失败，也保留其他账号已恢复的会话。每次使用新 key 保存。
+      - name: Save encrypted cookies
+        if: always() && env.GLADOS_EMAILS != '' && hashFiles('.glados/cookies.enc') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .glados/cookies.enc
+          key: glados-cookies-v1-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
 
   keepalive:
     name: 每月空提交保活

@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.glados/
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+credentials.json
+token.json
+*.log
+*.har
+*.har.json
+*.saz
+*.pcap
+*.pcapng
