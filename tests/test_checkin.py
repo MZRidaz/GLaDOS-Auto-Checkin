@@ -119,6 +119,17 @@ class EmailAccountsTests(unittest.TestCase):
         self.store.put("first@gmail.com", {"gld:sess": "first-cookie", "gld:sess.sig": "sig1"})
         self.store.put("second@gmail.com", {"gld:sess": "second-cookie", "gld:sess.sig": "sig2"})
 
+    def test_account_limit_does_not_delete_other_cached_accounts(self):
+        before = self.store.path.read_bytes()
+        with patch.object(auth.MailSettings, "from_env", return_value=self.config), \
+                patch.object(checkin, "CookieStore", return_value=self.store), \
+                patch.object(checkin, "BrowserCheckin"), \
+                patch.object(checkin, "run_email_accounts", return_value=[result(1, "first@gmail.com")]) as run, \
+                patch.object(checkin, "push_all", return_value=(0, 0)):
+            self.assertEqual(checkin.main(account_limit=1, no_exchange=True), 0)
+        self.assertEqual(run.call_args.args[0].emails, ["first@gmail.com"])
+        self.assertEqual(self.store.path.read_bytes(), before)
+
     def test_session_diagnostic_never_logs_in_checks_in_or_changes_cache(self):
         self.assertTrue(hasattr(checkin, "check_cached_sessions"), "尚无只读会话诊断入口")
         self.config.emails[:] = ["first@gmail.com", "second@gmail.com"]

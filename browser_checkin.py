@@ -199,6 +199,14 @@ class BrowserCheckin:
                     route.abort()
                     return
                 sent = True
+                try:
+                    body = request.post_data_json or {}
+                    state = body.get("tsState", "none")
+                    logger.info("签到验证参数: nonce=%s, proof=%s, Turnstile=%s, 状态=%s",
+                                bool(body.get("nonce")), bool(body.get("proof")),
+                                bool(body.get("turnstile")), state if state in ("ok", "off", "timeout", "error", "none") else "other")
+                except (ValueError, AttributeError):
+                    pass
             route.continue_()
 
         context.route("**/*", guard)
@@ -295,6 +303,12 @@ class BrowserCheckin:
                 raise BrowserCheckinError("签到响应不是 JSON，可能被 Cloudflare 拦截；不自动重复提交") from None
             if not isinstance(payload, dict) or "code" not in payload:
                 raise BrowserCheckinError("签到响应格式异常，不自动重复提交")
+            result_code = payload.get("code")
+            reason = payload.get("reason")
+            logger.info("签到接口响应: code=%s, reason=%s, repeated=%s",
+                        result_code if isinstance(result_code, (int, float)) else "?",
+                        reason if reason in ("turnstile", "device-mismatch") else ("none" if not reason else "other"),
+                        payload.get("repeated") is True)
             if response.status >= 400 and not is_auth_failure(payload):
                 raise BrowserCheckinError("浏览器签到 HTTP 请求失败，不自动重复提交")
             _sync_cookies(context, session, headers)

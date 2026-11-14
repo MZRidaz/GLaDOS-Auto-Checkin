@@ -18,6 +18,10 @@ on:
         options:
           - ubuntu-latest
           - windows-latest
+      account_limit:
+        description: 只测试前 N 个账号（0 表示全部，不删除其他缓存）
+        type: number
+        default: 0
   schedule:
     - cron: '17 1 * * *'  # 每日 UTC 1:17 签到（北京时间 9:17）
     - cron: '0 0 1 * *'   # 每月 1 号保活空提交
@@ -37,6 +41,7 @@ jobs:
 
     env:
       GLADOS_EMAILS: ${{ secrets.GLADOS_EMAILS }}
+      PYTHONIOENCODING: utf-8
 
     steps:
       - uses: actions/checkout@v4
@@ -84,13 +89,14 @@ jobs:
             display=(xvfb-run -a)
           fi
           case "$RUN_MODE" in
-            diagnose) "${display[@]}" python checkin.py --check-challenge ;;
-            checkin-no-exchange) "${display[@]}" python checkin.py --no-exchange ;;
-            checkin) "${display[@]}" python checkin.py ;;
+            diagnose) "${display[@]}" python checkin.py --check-challenge --account-limit "$ACCOUNT_LIMIT" ;;
+            checkin-no-exchange) "${display[@]}" python checkin.py --no-exchange --account-limit "$ACCOUNT_LIMIT" ;;
+            checkin) "${display[@]}" python checkin.py --account-limit "$ACCOUNT_LIMIT" ;;
             *) echo "Unknown run mode"; exit 1 ;;
           esac
         env:
           RUN_MODE: ${{ inputs.mode || 'checkin' }}
+          ACCOUNT_LIMIT: ${{ inputs.account_limit || '0' }}
           GLADOS_BROWSER_HEADLESS: 'false'
           GLADOS_BROWSER_CHANNEL: 'chrome'
           GLADOS_BROWSER_LAUNCH: 'native'

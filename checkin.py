@@ -16,6 +16,7 @@ import logging
 import argparse
 from typing import List, Dict, Any, Tuple, Optional, Callable
 from functools import wraps
+from dataclasses import replace
 import requests
 from glados_auth import (
     AuthError, CookieStore, EmailAuthenticator, MailSettings, is_auth_failure, session_cookies,
@@ -818,6 +819,7 @@ def run_email_accounts(settings, store, exchange_plan=None, browser=None):
                     store.remove(email)
                 elif acc["result"] in ("ok", "repeat"):
                     store.put(email, session_cookies(session))
+                logger.info("账号 %d 处理结果: %s", index, acc["status"])
                 accounts.append(acc)
         except AuthError as e:
             logger.warning("账号 %d 登录恢复失败: %s", index, e)
@@ -910,7 +912,10 @@ def check_browser_challenges(settings, store, cookies):
     return int(failed)
 
 
-def main(check_session=False, check_challenge=False, no_exchange=False) -> int:
+def main(check_session=False, check_challenge=False, no_exchange=False, account_limit=0) -> int:
+    if account_limit < 0:
+        logger.error("account-limit 必须为非负整数，0 表示全部账号")
+        return 1
     # H2：支持 ||| 或换行(\n)或 & 分隔多账号 Cookie；推荐使用 ||| 避免与 Cookie 值冲突
     raw = os.getenv("COOKIES", "")
     # 先归一化（剥离空白/引号/"Cookie:" 头名）再过滤空串，避免粘贴杂质导致误判
@@ -922,6 +927,12 @@ def main(check_session=False, check_challenge=False, no_exchange=False) -> int:
         logger.error("配置错误: %s", e)
         push_all("GLaDOS 签到", f"❌ 配置错误: {e}")
         return 1
+
+    if account_limit:
+        if mail_settings:
+            mail_settings = replace(mail_settings, emails=mail_settings.emails[:account_limit])
+        else:
+            cookies = cookies[:account_limit]
 
     if check_session:
         if not mail_settings:
@@ -1026,6 +1037,7 @@ if __name__ == "__main__":
     diagnostic.add_argument("--check-challenge", action="store_true",
                             help="只检查缓存会话及官网浏览器验证，不发验证码、不签到、不兑换")
     parser.add_argument("--no-exchange", action="store_true", help="本次运行强制关闭积分兑换")
+    parser.add_argument("--account-limit", type=int, default=0, help="只处理列表前 N 个账号；0 表示全部，其他账号缓存保留")
     args = parser.parse_args()
     sys.exit(main(check_session=args.check_session, check_challenge=args.check_challenge,
-                  no_exchange=args.no_exchange))
+                  no_exchange=args.no_exchange, account_limit=args.account_limit))
