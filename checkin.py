@@ -898,6 +898,9 @@ def check_browser_challenges(settings, store, cookies):
                     logger.info("账号 %d 验证诊断: challenge=%s, Turnstile=%s, 自动验证=%s",
                                 index, bool(result.get("challenge_loaded")),
                                 bool(result.get("turnstile_required")), "就绪" if passed else "未完成")
+                    logger.info("账号 %d 验证资源: 字段=%s, HTTP=%s, 错误码=%s, 被拦截的验证请求=%s",
+                                index, result.get("turnstile_fields", 0), result.get("turnstile_http", []),
+                                result.get("turnstile_codes", []), result.get("blocked_verification", 0))
                     failed |= not passed
                 except (AuthError, BrowserCheckinError) as error:
                     logger.warning("账号 %d 验证诊断失败: %s", index, error)

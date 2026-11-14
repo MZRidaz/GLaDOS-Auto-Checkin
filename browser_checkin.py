@@ -1,6 +1,7 @@
 """让官网页面完成签到验证；不复制验证算法、不复用 Turnstile 令牌。"""
 import logging
 import os
+import re
 from urllib.parse import urlsplit
 
 from glados_auth import is_auth_failure
@@ -90,20 +91,36 @@ class BrowserCheckin:
         sent = False
         armed = False
         base = urlsplit(ORIGIN)
+        turnstile_codes = set()
+        turnstile_http = set()
+        blocked_verification = 0
+
+        def console_message(message):
+            # 只收集固定格式的错误码，不记录控制台原文（可能包含账号或令牌）。
+            for code in re.findall(r"Turnstile\][^\d]{0,40}(\d{6})", message.text):
+                turnstile_codes.add(code)
+
+        def resource_response(response):
+            if urlsplit(response.url).hostname == "challenges.cloudflare.com":
+                turnstile_http.add(response.status)
 
         def guard(route):
-            nonlocal sent
+            nonlocal sent, blocked_verification
             request = route.request
             url = urlsplit(request.url)
             if (url.scheme, url.netloc) == (base.scheme, base.netloc) and request.method not in ("GET", "HEAD", "OPTIONS"):
                 # 官网页面只能提交一次签到，不允许兑换、游戏、退出或验证码写操作。
                 if readonly or not armed or sent or request.method != "POST" or url.path != "/api/user/checkin":
+                    if url.path.startswith("/cdn-cgi/challenge-platform/"):
+                        blocked_verification += 1
                     route.abort()
                     return
                 sent = True
             route.continue_()
 
         context.route("**/*", guard)
+        page.on("console", console_message)
+        page.on("response", resource_response)
         try:
             context.add_cookies(_cookies_for_browser(session, headers))
             response = page.goto(ORIGIN + "/api/user/status", wait_until="domcontentloaded")
@@ -159,7 +176,10 @@ class BrowserCheckin:
                 ready = page.locator('input[name="cf-turnstile-response"]').evaluate_all(
                     "nodes => nodes.some(node => node.value.length > 0)")
                 return {"code": 0, "challenge_loaded": challenge.get("code") == 0 and bool(challenge.get("nonce")),
-                        "turnstile_required": bool(challenge.get("turnstile")), "turnstile_ready": ready}
+                        "turnstile_required": bool(challenge.get("turnstile")), "turnstile_ready": ready,
+                        "turnstile_fields": page.locator('input[name="cf-turnstile-response"]').count(),
+                        "turnstile_http": sorted(turnstile_http), "turnstile_codes": sorted(turnstile_codes),
+                        "blocked_verification": blocked_verification}
 
             logger.info("通过官网浏览器页面执行签到验证（当前浏览器会话最多提交一次）")
             armed = True
