@@ -63,6 +63,8 @@ Actions 使用 `GLADOS_BROWSER_LAUNCH=native`：独立启动自己的 Chrome，�
 | `diagnose` | 只检查已有缓存和官网验证是否自动就绪，不发验证码、不签到、不兑换、不写缓存 |
 | `checkin-no-exchange` | 正常签到并允许必要的邮箱恢复，本次强制关闭积分兑换 |
 
+`runner` 可选择 GitHub 托管的 `ubuntu-latest` 或 `windows-latest`，用于比较验证兼容性；两者均无需自托管机器。Windows 使用原生桌面 Chrome，Ubuntu 使用 xvfb。缓存启用跨系统恢复，仍只缓存 Fernet 密文。定时任务当前默认 Ubuntu；更换默认环境前应先确认新签到成功。
+
 Cloudflare 若未能自动完成验证，脚本会明确报错，保留会话并继续处理后续账号；不会因这一错误反复发验证码，也不会在签到失败后兑换积分。浏览器页面只允许本次签到写请求，其他兑换、游戏和登录写操作由浏览器拦截。实际兑换仍仅由 Python 按显式配置执行。
 
 `diagnose` 模式会输出验证资源 HTTP 状态和固定格式错误码。若验证框可见但未完成，会仅裁剪验证框上传为 `verification-widget` artifact，保留 1 天；不会截图完整账号页面，也不上传 Cookie、邮箱凭据或加密缓存。

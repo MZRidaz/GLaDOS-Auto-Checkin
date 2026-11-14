@@ -87,6 +87,15 @@ class BrowserCheckin:
         else:
             names = ("google-chrome", "google-chrome-stable", "chrome", "chrome.exe") if self.channel == "chrome" else ("microsoft-edge", "msedge", "msedge.exe")
             executable = next((path for name in names if (path := shutil.which(name))), None)
+            if not executable and os.name == "nt":
+                relative = ("Google/Chrome/Application/chrome.exe" if self.channel == "chrome" else
+                            "Microsoft/Edge/Application/msedge.exe")
+                for variable in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+                    root = os.getenv(variable)
+                    candidate = Path(root) / relative if root else None
+                    if candidate and candidate.is_file():
+                        executable = str(candidate)
+                        break
             if not executable:
                 raise BrowserCheckinError("所选原生浏览器不在 PATH 中")
         self.profile = tempfile.TemporaryDirectory(prefix="glados-chrome-")
