@@ -15,6 +15,13 @@ from glados_auth import is_auth_failure
 
 ORIGIN = "https://glados.cloud"
 logger = logging.getLogger("GLaDOS")
+TOKEN_READY = """() => {
+    try {
+        if (window.turnstile && window.turnstile.getResponse()) return true;
+    } catch (_) {}
+    return [...document.querySelectorAll('input[name="cf-turnstile-response"]')]
+        .some(node => node.value.length > 0);
+}"""
 
 
 class BrowserCheckinError(RuntimeError):
@@ -234,29 +241,34 @@ class BrowserCheckin:
                 # 读取页面实际生成的令牌状态，不输出 nonce/proof/令牌本身。
                 if challenge.get("turnstile"):
                     try:
-                        page.wait_for_function("""() => {
-                            const token = document.querySelector('input[name="cf-turnstile-response"]');
-                            return token && token.value.length > 0;
-                        }""", timeout=min(self.timeout_ms, 30000))
+                        page.wait_for_function(TOKEN_READY, timeout=min(self.timeout_ms, 30000))
                     except Exception:
                         pass
-                ready = page.locator('input[name="cf-turnstile-response"]').evaluate_all(
-                    "nodes => nodes.some(node => node.value.length > 0)")
+                ready = page.evaluate(TOKEN_READY)
+                visibility = page.evaluate("({focused:document.hasFocus(),visible:document.visibilityState})")
                 if not ready and os.getenv("GLADOS_DIAGNOSTIC_SCREENSHOTS") == "true":
                     frames = page.locator('iframe[src^="https://challenges.cloudflare.com/"]')
-                    for frame in frames.all():
-                        if frame.is_visible():
+                    candidates = frames.all()
+                    fields = page.locator('input[name="cf-turnstile-response"]')
+                    if fields.count():
+                        candidates.append(fields.first.locator(".."))
+                    for frame in candidates:
+                        box = frame.bounding_box()
+                        if box and 20 <= box["width"] <= 400 and 20 <= box["height"] <= 150:
                             # 只裁剪公开验证框，绝不截图包含邮箱/积分的完整账号页面。
                             folder = Path(".glados/diagnostics")
                             folder.mkdir(parents=True, exist_ok=True)
                             self._capture_index = getattr(self, "_capture_index", 0) + 1
-                            frame.screenshot(path=str(folder / f"turnstile-{self._capture_index}.png"), timeout=5000)
+                            try:
+                                frame.screenshot(path=str(folder / f"turnstile-{self._capture_index}.png"), timeout=5000)
+                            except Exception:
+                                pass
                             break
                 return {"code": 0, "challenge_loaded": challenge.get("code") == 0 and bool(challenge.get("nonce")),
                         "turnstile_required": bool(challenge.get("turnstile")), "turnstile_ready": ready,
                         "turnstile_fields": page.locator('input[name="cf-turnstile-response"]').count(),
                         "turnstile_http": sorted(turnstile_http), "turnstile_codes": sorted(turnstile_codes),
-                        "blocked_verification": blocked_verification}
+                        "blocked_verification": blocked_verification, "visibility": visibility}
 
             logger.info("通过官网浏览器页面执行签到验证（当前浏览器会话最多提交一次）")
             armed = True

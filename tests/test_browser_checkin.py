@@ -79,6 +79,8 @@ class Fixture(BaseHTTPRequestHandler):
                           "turnstile": "test-sitekey"})
         elif self.path == "/console/checkin":
             page = PAGE.replace("TOKEN", self.server.token)
+            if self.server.api_token:
+                page = page.replace("<script>", "<script>window.turnstile={getResponse:()=> 'fixture-api-token'};")
             if self.server.background:
                 page = page.replace("<script>", "<script>fetch('/api/user/checkin',{method:'POST',body:'background'}).catch(()=>{});")
             self.respond(page, content_type="text/html")
@@ -130,6 +132,7 @@ class BrowserFlowTests(unittest.TestCase):
         self.server.status = {"code": 0, "data": {"email": "first@example.com"}}
         self.server.result = {"code": 0, "points": 7, "message": "Got 7 points"}
         self.server.token = "fixture-token"
+        self.server.api_token = False
         self.server.background = False
         self.server.stall = False
         self.session = requests.Session()
@@ -181,6 +184,13 @@ class BrowserFlowTests(unittest.TestCase):
         self.assertFalse(result["turnstile_ready"])
         self.assertEqual(self.server.posts, [])
 
+    def test_diagnostic_uses_public_widget_api_when_response_field_is_empty(self):
+        self.server.token = ""
+        self.server.api_token = True
+        result = self.driver.diagnose(self.session, {}, "first@example.com")
+        self.assertTrue(result["turnstile_ready"])
+        self.assertEqual(self.server.posts, [])
+
     def test_account_context_does_not_leak_cookies_to_next_account(self):
         self.driver.submit(self.session, {}, "first@example.com")
         empty = requests.Session()
@@ -217,6 +227,7 @@ class NativeBrowserTests(unittest.TestCase):
         server.gets, server.posts = [], []
         server.background, server.stall = False, False
         server.token = "fixture-token"
+        server.api_token = False
         server.status = {"code": 0, "data": {"email": "first@example.com"}}
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
