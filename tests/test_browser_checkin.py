@@ -86,7 +86,22 @@ class Fixture(BaseHTTPRequestHandler):
                 page = page.replace("<script>", "<script>addEventListener('scroll',()=>{document.querySelector('input').value='visible-token'});")
             if self.server.background:
                 page = page.replace("<script>", "<script>fetch('/api/user/checkin',{method:'POST',body:'background'}).catch(()=>{});")
+            if self.server.checkbox:
+                page = page.replace("<script>", """<div id="verification"></div><script>
+                    document.querySelector('#verification').attachShadow({mode:'closed'}).innerHTML =
+                        '<iframe width="300" height="65" src="/widget"></iframe>';
+                    addEventListener('message',event=>{
+                        if(event.origin===location.origin && event.data==='fixture-verified')
+                            document.querySelector('input').value='fixture-completed-token';
+                    });
+                """)
             self.respond(page, content_type="text/html")
+        elif self.path == "/widget":
+            self.respond("""<div id="root"></div><script>
+                const root=document.querySelector('#root').attachShadow({mode:'closed'});
+                root.innerHTML='<label><input type="checkbox" aria-label="Verify you are human">Verify you are human</label>';
+                root.querySelector('input').onchange=()=>parent.postMessage('fixture-verified',location.origin);
+            </script>""", content_type="text/html")
         else:
             self.respond({}, 404)
 
@@ -137,6 +152,7 @@ class BrowserFlowTests(unittest.TestCase):
         self.server.token = "fixture-token"
         self.server.api_token = False
         self.server.below_fold = False
+        self.server.checkbox = False
         self.server.background = False
         self.server.stall = False
         self.session = requests.Session()
@@ -215,6 +231,14 @@ class BrowserFlowTests(unittest.TestCase):
         self.assertEqual(boxes[0]["width"], 300)
         self.assertEqual(boxes[0]["height"], 65)
 
+    def test_standard_verification_checkbox_is_completed_without_business_post(self):
+        self.server.token = ""
+        self.server.checkbox = True
+        with patch.object(browser, "TURNSTILE_HOST", "127.0.0.1", create=True):
+            result = self.driver.diagnose(self.session, {}, "first@example.com")
+        self.assertTrue(result["turnstile_ready"])
+        self.assertEqual(self.server.posts, [])
+
     def test_account_context_does_not_leak_cookies_to_next_account(self):
         self.driver.submit(self.session, {}, "first@example.com")
         empty = requests.Session()
@@ -253,6 +277,7 @@ class NativeBrowserTests(unittest.TestCase):
         server.token = "fixture-token"
         server.api_token = False
         server.below_fold = False
+        server.checkbox = False
         server.status = {"code": 0, "data": {"email": "first@example.com"}}
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:

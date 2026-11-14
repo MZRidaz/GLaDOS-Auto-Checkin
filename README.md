@@ -51,6 +51,8 @@
 
 官网现在会先获取 `/api/user/checkin/challenge`，在页面中生成 proof，并按要求完成 Cloudflare Turnstile 验证，然后提交签到。脚本通过 Playwright 的标准 Chromium 点击官网签到按钮，让官网代码完成这些步骤，不再直接发送旧的固定 token 请求。
 
+如果出现标准的 “Verify you are human” 勾选框，脚本会在确认它位于 Cloudflare 验证域、可访问性角色为 checkbox 后尝试一次正常键盘勾选，再等待官方 API 返回真实令牌。支持验证组件的封闭 Shadow DOM；不会直接填写令牌或处理图片题。`diagnose` 也会检查这一验证交互，但不会点击签到按钮。
+
 Actions 会自动安装浏览器系统依赖和离线测试所需的 Chromium，实际签到使用 runner 自带的稳定版 Chrome，在 `xvfb` 虚拟显示器中以有界面模式运行，不需要配置桌面或额外的验证码服务。每个账号使用独立浏览器环境，登录、查询、签到使用相同的浏览器 User-Agent；更新后的 Cookie 仍保存到原有加密缓存。
 
 Actions 使用 `GLADOS_BROWSER_LAUNCH=native`：独立启动自己的 Chrome，再通过仅监听本机的 DevTools 连接控制。使用随机临时 profile，退出时删除，不接管个人浏览器，不修改浏览器验证属性。没有第三方解码服务或伪造令牌。本地默认由 Playwright 启动，也可设置该变量对比原生启动；原生 Chrome / Edge 需能在 PATH 中找到，Chromium 使用 Playwright 安装路径。

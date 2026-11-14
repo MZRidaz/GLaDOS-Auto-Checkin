@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 from glados_auth import is_auth_failure
 
 ORIGIN = "https://glados.cloud"
+TURNSTILE_HOST = "challenges.cloudflare.com"
 logger = logging.getLogger("GLaDOS")
 TOKEN_READY = """() => {
     try {
@@ -53,9 +54,10 @@ def _sync_cookies(context, session, headers):
         headers["cookie"] = "; ".join(c["name"] + "=" + c["value"] for c in cookies)
 
 
-def _verification_boxes(page, hostname="challenges.cloudflare.com"):
+def _verification_boxes(page, hostname=None):
     """通过 DevTools 定位验证 iframe，包括组件的封闭 Shadow DOM；不返回页面文字。"""
     client = page.context.new_cdp_session(page)
+    hostname = hostname or TURNSTILE_HOST
     boxes = []
     try:
         pending = [client.send("DOM.getDocument", {"depth": -1, "pierce": True})["root"]]
@@ -82,6 +84,55 @@ def _verification_boxes(page, hostname="challenges.cloudflare.com"):
         return boxes
     finally:
         client.detach()
+
+
+def _activate_verification_checkbox(page):
+    """只操作验证域中明确标为 human/verify 的标准 checkbox，不处理图像题。"""
+    for frame in page.frames:
+        if urlsplit(frame.url).hostname != TURNSTILE_HOST:
+            continue
+        client = None
+        try:
+            params = {}
+            try:
+                client = page.context.new_cdp_session(frame)
+            except Exception:
+                # 同进程 iframe 没有独立 CDP target，通过 frameId 查询自己的 AX 树。
+                client = page.context.new_cdp_session(page)
+                pending = [client.send("Page.getFrameTree")["frameTree"]]
+                while pending:
+                    item = pending.pop()
+                    pending.extend(item.get("childFrames", []))
+                    if item.get("frame", {}).get("url") == frame.url:
+                        params = {"frameId": item["frame"]["id"]}
+                        break
+                if not params:
+                    continue
+            nodes = client.send("Accessibility.getFullAXTree", params)["nodes"]
+            for node in nodes:
+                if node.get("role", {}).get("value") != "checkbox":
+                    continue
+                name = str(node.get("name", {}).get("value", "")).lower()
+                if not any(word in name for word in ("human", "verify", "真人", "验证")):
+                    continue
+                properties = {p["name"]: p.get("value", {}).get("value") for p in node.get("properties", [])}
+                if properties.get("disabled") is True or properties.get("checked") in (True, "true"):
+                    continue
+                if not node.get("backendDOMNodeId"):
+                    continue
+                client.send("DOM.focus", {"backendNodeId": node["backendDOMNodeId"]})
+                page.keyboard.press("Space")
+                logger.info("已操作官网 Cloudflare 标准验证框，等待实际验证结果")
+                return True
+        except Exception:
+            continue
+        finally:
+            if client:
+                try:
+                    client.detach()
+                except Exception:
+                    pass
+    return False
 
 
 class BrowserCheckin:
@@ -197,6 +248,17 @@ class BrowserCheckin:
                         raise BrowserCheckinError("浏览器临时目录边界检查失败，已跳过清理")
                     self.profile.cleanup()
 
+    def _wait_for_verification(self, page):
+        deadline = time.monotonic() + min(self.timeout_ms, 30000) / 1000
+        interacted = False
+        while time.monotonic() < deadline:
+            if page.evaluate(TOKEN_READY):
+                return True
+            if not interacted:
+                interacted = _activate_verification_checkbox(page)
+            page.wait_for_timeout(250)
+        return bool(page.evaluate(TOKEN_READY))
+
     def _run(self, session, headers, expected_email, readonly):
         context = self.browser.new_context(user_agent=self.user_agent, locale="en-US",
                                            service_workers="block")
@@ -285,16 +347,11 @@ class BrowserCheckin:
                 return challenge
             if challenge.get("code") != 0 or not challenge.get("nonce"):
                 raise BrowserCheckinError("官网签到 challenge 被拒绝，未提交签到")
+            button.scroll_into_view_if_needed()
+            _verification_boxes(page)
+            ready = self._wait_for_verification(page) if challenge.get("turnstile") else False
             if readonly:
-                button.scroll_into_view_if_needed()
-                _verification_boxes(page)
                 # 读取页面实际生成的令牌状态，不输出 nonce/proof/令牌本身。
-                if challenge.get("turnstile"):
-                    try:
-                        page.wait_for_function(TOKEN_READY, timeout=min(self.timeout_ms, 30000))
-                    except Exception:
-                        pass
-                ready = page.evaluate(TOKEN_READY)
                 visibility = page.evaluate("({focused:document.hasFocus(),visible:document.visibilityState})")
                 if not ready and os.getenv("GLADOS_DIAGNOSTIC_SCREENSHOTS") == "true":
                     closed_boxes = _verification_boxes(page)
