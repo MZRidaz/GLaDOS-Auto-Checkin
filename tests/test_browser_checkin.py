@@ -29,7 +29,8 @@ class BrowserContractTests(unittest.TestCase):
         self.assertEqual([c["value"] for c in cookies], ["legacy==", "sig"])
 
     def test_invalid_browser_settings_fail_before_opening_any_mailbox(self):
-        for env in ({"GLADOS_BROWSER_HEADLESS": "invalid"}, {"GLADOS_BROWSER_TIMEOUT": "-1"}):
+        for env in ({"GLADOS_BROWSER_HEADLESS": "invalid"}, {"GLADOS_BROWSER_TIMEOUT": "-1"},
+                    {"GLADOS_BROWSER_CHANNEL": "invalid"}):
             with self.subTest(env=env), patch.dict(os.environ, env, clear=True):
                 with self.assertRaises(browser.BrowserCheckinError):
                     browser.BrowserCheckin()

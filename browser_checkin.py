@@ -2,6 +2,7 @@
 import logging
 import os
 import re
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from glados_auth import is_auth_failure
@@ -43,6 +44,9 @@ class BrowserCheckin:
     """共享 Chromium 进程，每次签到创建独立、用后即关的账号 context。"""
 
     def __init__(self, *, headless=None, timeout_ms=None):
+        self.channel = os.getenv("GLADOS_BROWSER_CHANNEL", "chromium").strip().lower()
+        if self.channel not in ("chromium", "chrome", "msedge"):
+            raise BrowserCheckinError("GLADOS_BROWSER_CHANNEL 必须为 chromium、chrome 或 msedge")
         raw = os.getenv("GLADOS_BROWSER_HEADLESS", "true").strip().lower()
         if headless is None and raw not in ("true", "false", "1", "0"):
             raise BrowserCheckinError("GLADOS_BROWSER_HEADLESS 必须为 true 或 false")
@@ -66,14 +70,14 @@ class BrowserCheckin:
             raise BrowserCheckinError("请安装 requirements.txt 依赖及 Chromium：python -m playwright install chromium") from None
         try:
             self.runtime = sync_playwright().start()
-            self.browser = self.runtime.chromium.launch(headless=self.headless, channel="chromium")
+            self.browser = self.runtime.chromium.launch(headless=self.headless, channel=self.channel)
             page = self.browser.new_page()
             self.user_agent = page.evaluate("navigator.userAgent")
             page.close()
             return self
         except Exception:
             self.__exit__(None, None, None)
-            raise BrowserCheckinError("Chromium 启动失败，请运行 python -m playwright install --with-deps chromium；有界面模式需要显示器或 xvfb") from None
+            raise BrowserCheckinError("浏览器启动失败：chrome/msedge 需要已安装对应浏览器；chromium 请运行 python -m playwright install --with-deps chromium。有界面模式需要显示器或 xvfb") from None
 
     def __exit__(self, *_):
         try:
@@ -175,6 +179,16 @@ class BrowserCheckin:
                         pass
                 ready = page.locator('input[name="cf-turnstile-response"]').evaluate_all(
                     "nodes => nodes.some(node => node.value.length > 0)")
+                if not ready and os.getenv("GLADOS_DIAGNOSTIC_SCREENSHOTS") == "true":
+                    frames = page.locator('iframe[src^="https://challenges.cloudflare.com/"]')
+                    for frame in frames.all():
+                        if frame.is_visible():
+                            # 只裁剪公开验证框，绝不截图包含邮箱/积分的完整账号页面。
+                            folder = Path(".glados/diagnostics")
+                            folder.mkdir(parents=True, exist_ok=True)
+                            self._capture_index = getattr(self, "_capture_index", 0) + 1
+                            frame.screenshot(path=str(folder / f"turnstile-{self._capture_index}.png"))
+                            break
                 return {"code": 0, "challenge_loaded": challenge.get("code") == 0 and bool(challenge.get("nonce")),
                         "turnstile_required": bool(challenge.get("turnstile")), "turnstile_ready": ready,
                         "turnstile_fields": page.locator('input[name="cf-turnstile-response"]').count(),

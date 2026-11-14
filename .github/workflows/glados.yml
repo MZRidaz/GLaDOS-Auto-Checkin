@@ -63,6 +63,7 @@ jobs:
 
       - name: Run checkin
         run: |
+          google-chrome --version
           case "$RUN_MODE" in
             diagnose) xvfb-run -a python checkin.py --check-challenge ;;
             checkin-no-exchange) xvfb-run -a python checkin.py --no-exchange ;;
@@ -72,6 +73,8 @@ jobs:
         env:
           RUN_MODE: ${{ inputs.mode || 'checkin' }}
           GLADOS_BROWSER_HEADLESS: 'false'
+          GLADOS_BROWSER_CHANNEL: 'chrome'
+          GLADOS_DIAGNOSTIC_SCREENSHOTS: ${{ inputs.mode == 'diagnose' && 'true' || 'false' }}
           GLADOS_BROWSER_TIMEOUT: ${{ vars.GLADOS_BROWSER_TIMEOUT || '120' }}
           COOKIES: ${{ secrets.COOKIES || vars.COOKIES }}
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
@@ -95,6 +98,16 @@ jobs:
           # #9 积分兑换计划（可选；不配置则默认不兑换，不影响现有签到）
           EXCHANGE_PLAN: ${{ secrets.EXCHANGE_PLAN }}
           GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
+
+      - name: Upload verification widget diagnostics
+        if: always() && inputs.mode == 'diagnose'
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-widget
+          path: .glados/diagnostics/turnstile-*.png
+          retention-days: 1
+          if-no-files-found: ignore
+          include-hidden-files: true
 
       # 即使某个账号失败，也保留其他账号已恢复的会话。每次使用新 key 保存。
       - name: Save encrypted cookies

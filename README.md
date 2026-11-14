@@ -51,7 +51,7 @@
 
 官网现在会先获取 `/api/user/checkin/challenge`，在页面中生成 proof，并按要求完成 Cloudflare Turnstile 验证，然后提交签到。脚本通过 Playwright 的标准 Chromium 点击官网签到按钮，让官网代码完成这些步骤，不再直接发送旧的固定 token 请求。
 
-Actions 会自动安装 Chromium 及系统依赖，并在 `xvfb` 虚拟显示器中运行有界面的浏览器，不需要配置桌面或额外的验证码服务。每个账号使用独立浏览器环境，登录、查询、签到使用相同的浏览器 User-Agent；更新后的 Cookie 仍保存到原有加密缓存。
+Actions 会自动安装浏览器系统依赖和离线测试所需的 Chromium，实际签到使用 runner 自带的稳定版 Chrome，在 `xvfb` 虚拟显示器中以有界面模式运行，不需要配置桌面或额外的验证码服务。每个账号使用独立浏览器环境，登录、查询、签到使用相同的浏览器 User-Agent；更新后的 Cookie 仍保存到原有加密缓存。
 
 手动点击 **Actions → GLaDOS Auto Checkin → Run workflow** 时可选择 `mode`：
 
@@ -63,9 +63,11 @@ Actions 会自动安装 Chromium 及系统依赖，并在 `xvfb` 虚拟显示器
 
 Cloudflare 若未能自动完成验证，脚本会明确报错，保留会话并继续处理后续账号；不会因这一错误反复发验证码，也不会在签到失败后兑换积分。浏览器页面只允许本次签到写请求，其他兑换、游戏和登录写操作由浏览器拦截。实际兑换仍仅由 Python 按显式配置执行。
 
+`diagnose` 模式会输出验证资源 HTTP 状态和固定格式错误码。若验证框可见但未完成，会仅裁剪验证框上传为 `verification-widget` artifact，保留 1 天；不会截图完整账号页面，也不上传 Cookie、邮箱凭据或加密缓存。
+
 **自动运行的边界**：标准浏览器能执行官网的验证流程，但 Cloudflare 仍可能要求人工交互，不能保证所有出口 IP 都能无人值守通过。遇到此情况，可先运行 `diagnose` 区分“缓存失效”和“浏览器验证未完成”，再在正常浏览器处理人工验证。不要把 Turnstile 令牌存成长期 Secret；令牌一次有效，且会很快过期。“已签到”的运行结果也不能证明当天新签到验证一定能通过。
 
-可选 Variable `GLADOS_BROWSER_TIMEOUT` 控制每个浏览器操作等待时间，默认 `120` 秒，可设 `30`–`300` 秒。测试分支没有缓存时可以读取 `main` 的已有密文缓存；保存仍使用当前分支独立的 key。
+可选 Variable `GLADOS_BROWSER_TIMEOUT` 控制每个浏览器操作等待时间，默认 `120` 秒，可设 `30`–`300` 秒。本地默认使用 Chromium；已安装 Chrome 或 Edge 时可设置环境变量 `GLADOS_BROWSER_CHANNEL=chrome` 或 `msedge`，不需要更改邮箱配置。测试分支没有缓存时可以读取 `main` 的已有密文缓存；保存仍使用当前分支独立的 key。
 
 ### 推荐：统一 Gmail 收件箱，自动恢复多个账号
 
