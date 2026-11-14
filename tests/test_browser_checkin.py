@@ -81,6 +81,9 @@ class Fixture(BaseHTTPRequestHandler):
             page = PAGE.replace("TOKEN", self.server.token)
             if self.server.api_token:
                 page = page.replace("<script>", "<script>window.turnstile={getResponse:()=> 'fixture-api-token'};")
+            if self.server.below_fold:
+                page = page.replace('<input type="hidden"', '<div style="height:2000px"></div><input type="hidden"')
+                page = page.replace("<script>", "<script>addEventListener('scroll',()=>{document.querySelector('input').value='visible-token'});")
             if self.server.background:
                 page = page.replace("<script>", "<script>fetch('/api/user/checkin',{method:'POST',body:'background'}).catch(()=>{});")
             self.respond(page, content_type="text/html")
@@ -133,6 +136,7 @@ class BrowserFlowTests(unittest.TestCase):
         self.server.result = {"code": 0, "points": 7, "message": "Got 7 points"}
         self.server.token = "fixture-token"
         self.server.api_token = False
+        self.server.below_fold = False
         self.server.background = False
         self.server.stall = False
         self.session = requests.Session()
@@ -191,6 +195,26 @@ class BrowserFlowTests(unittest.TestCase):
         self.assertTrue(result["turnstile_ready"])
         self.assertEqual(self.server.posts, [])
 
+    def test_diagnostic_scrolls_verification_area_into_view_without_clicking(self):
+        self.server.token = ""
+        self.server.below_fold = True
+        result = self.driver.diagnose(self.session, {}, "first@example.com")
+        self.assertTrue(result["turnstile_ready"])
+        self.assertEqual(self.server.posts, [])
+
+    def test_verification_box_can_be_located_inside_closed_shadow_dom(self):
+        with self.driver.browser.new_context() as context:
+            page = context.new_page()
+            page.set_content('<div id="widget"></div>')
+            page.evaluate("""url => {
+                const shadow = document.querySelector('#widget').attachShadow({mode:'closed'});
+                shadow.innerHTML = '<iframe width="300" height="65" src="' + url + '"></iframe>';
+            }""", self.origin + "/widget")
+            boxes = browser._verification_boxes(page, hostname="127.0.0.1")
+        self.assertEqual(len(boxes), 1)
+        self.assertEqual(boxes[0]["width"], 300)
+        self.assertEqual(boxes[0]["height"], 65)
+
     def test_account_context_does_not_leak_cookies_to_next_account(self):
         self.driver.submit(self.session, {}, "first@example.com")
         empty = requests.Session()
@@ -228,6 +252,7 @@ class NativeBrowserTests(unittest.TestCase):
         server.background, server.stall = False, False
         server.token = "fixture-token"
         server.api_token = False
+        server.below_fold = False
         server.status = {"code": 0, "data": {"email": "first@example.com"}}
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:

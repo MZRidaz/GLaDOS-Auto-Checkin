@@ -53,6 +53,37 @@ def _sync_cookies(context, session, headers):
         headers["cookie"] = "; ".join(c["name"] + "=" + c["value"] for c in cookies)
 
 
+def _verification_boxes(page, hostname="challenges.cloudflare.com"):
+    """通过 DevTools 定位验证 iframe，包括组件的封闭 Shadow DOM；不返回页面文字。"""
+    client = page.context.new_cdp_session(page)
+    boxes = []
+    try:
+        pending = [client.send("DOM.getDocument", {"depth": -1, "pierce": True})["root"]]
+        while pending:
+            node = pending.pop()
+            pending.extend(node.get("children", []))
+            pending.extend(node.get("shadowRoots", []))
+            if node.get("nodeName") != "IFRAME":
+                continue
+            attributes = node.get("attributes", [])
+            attributes = dict(zip(attributes[::2], attributes[1::2]))
+            if urlsplit(attributes.get("src", "")).hostname != hostname:
+                continue
+            try:
+                target = {"backendNodeId": node["backendNodeId"]}
+                client.send("DOM.scrollIntoViewIfNeeded", target)
+                quad = client.send("DOM.getBoxModel", target)["model"]["content"]
+                x, y = min(quad[::2]), min(quad[1::2])
+                width, height = max(quad[::2]) - x, max(quad[1::2]) - y
+                if x >= 0 and y >= 0 and 20 <= width <= 400 and 20 <= height <= 150:
+                    boxes.append({"x": x, "y": y, "width": width, "height": height})
+            except Exception:
+                continue
+        return boxes
+    finally:
+        client.detach()
+
+
 class BrowserCheckin:
     """共享 Chromium 进程，每次签到创建独立、用后即关的账号 context。"""
 
@@ -255,6 +286,8 @@ class BrowserCheckin:
             if challenge.get("code") != 0 or not challenge.get("nonce"):
                 raise BrowserCheckinError("官网签到 challenge 被拒绝，未提交签到")
             if readonly:
+                button.scroll_into_view_if_needed()
+                _verification_boxes(page)
                 # 读取页面实际生成的令牌状态，不输出 nonce/proof/令牌本身。
                 if challenge.get("turnstile"):
                     try:
@@ -264,12 +297,19 @@ class BrowserCheckin:
                 ready = page.evaluate(TOKEN_READY)
                 visibility = page.evaluate("({focused:document.hasFocus(),visible:document.visibilityState})")
                 if not ready and os.getenv("GLADOS_DIAGNOSTIC_SCREENSHOTS") == "true":
+                    closed_boxes = _verification_boxes(page)
+                    if closed_boxes:
+                        folder = Path(".glados/diagnostics")
+                        folder.mkdir(parents=True, exist_ok=True)
+                        self._capture_index = getattr(self, "_capture_index", 0) + 1
+                        page.screenshot(path=str(folder / f"turnstile-{self._capture_index}.png"),
+                                        clip=closed_boxes[0], timeout=5000)
                     frames = page.locator('iframe[src^="https://challenges.cloudflare.com/"]')
                     candidates = frames.all()
                     fields = page.locator('input[name="cf-turnstile-response"]')
                     if fields.count():
                         candidates.append(fields.first.locator(".."))
-                    for frame in candidates:
+                    for frame in ([] if closed_boxes else candidates):
                         box = frame.bounding_box()
                         if box and 20 <= box["width"] <= 400 and 20 <= box["height"] <= 150:
                             # 只裁剪公开验证框，绝不截图包含邮箱/积分的完整账号页面。
