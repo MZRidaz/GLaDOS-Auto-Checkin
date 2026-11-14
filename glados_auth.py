@@ -277,6 +277,8 @@ class GmailMailbox:
 
 
 def is_auth_failure(payload):
+    if payload.get("reason") == "turnstile":
+        return False  # 验证令牌失效不代表账号会话失效，不能因此反复发邮件。
     message = str(payload.get("message", "")).lower()
     return (payload.get("code") in (-2, "-2")
             or payload.get("reason") == "device-mismatch"

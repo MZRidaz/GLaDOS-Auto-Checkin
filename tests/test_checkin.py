@@ -17,6 +17,35 @@ def result(index, email, status="repeat", expired=False):
 
 
 class CheckinIntegrationTests(unittest.TestCase):
+    def test_turnstile_reason_takes_priority_over_auth_like_error_message(self):
+        with patch.object(checkin, "checkin_request", return_value={
+                "code": 4, "reason": "turnstile", "message": "Cloudflare Turnstile: invalid token"}), \
+                patch.object(checkin, "api_get", side_effect=[
+                    {"code": 0, "data": {"email": "first@gmail.com"}}, {"points": 1}]):
+            outcome = checkin.checkin_account(requests.Session(), None, 1, expected_email="first@gmail.com")
+        self.assertFalse(outcome["auth_failed"])
+        self.assertEqual(outcome["result"], "fail")
+        self.assertNotIn("重新获取 Cookie", outcome["status"])
+
+    def test_cloudflare_failure_keeps_cookie_and_never_exchanges_points(self):
+        with patch.object(checkin, "checkin_request", return_value={
+                "code": 4, "reason": "turnstile", "message": "Cloudflare verification failed"}), \
+                patch.object(checkin, "api_get", side_effect=[
+                    {"code": 0, "data": {"email": "first@gmail.com"}}, {"points": 900}]), \
+                patch.object(checkin, "exchange_request") as exchange:
+            outcome = checkin.checkin_account(requests.Session(), None, 1, "plan500")
+        self.assertFalse(outcome["auth_failed"])
+        self.assertEqual(outcome["result"], "fail")
+        exchange.assert_not_called()
+
+    def test_current_api_repeated_flag_does_not_count_as_new_points(self):
+        with patch.object(checkin, "checkin_request", return_value={
+                "code": 0, "repeated": True, "points": 7, "message": "Done"}), \
+                patch.object(checkin, "api_get", side_effect=[
+                    {"code": 0, "data": {"email": "first@gmail.com"}}, {"points": 900}]):
+            outcome = checkin.checkin_account(requests.Session(), None, 1)
+        self.assertEqual(outcome["result"], "repeat")
+
     def test_http_auth_failure_is_classified_for_recovery(self):
         for code in (401, 403):
             with self.subTest(http=code):
@@ -24,7 +53,7 @@ class CheckinIntegrationTests(unittest.TestCase):
                 response = requests.Response()
                 response.status_code = code
                 response._content = b'{"code": -2, "message": "unauthorized"}'
-                with patch.object(session, "post", return_value=response):
+                with patch.object(checkin, "checkin_request", return_value=checkin.core_response(response)):
                     outcome = checkin.checkin_account(session, None, 1)
                 self.assertTrue(outcome["auth_failed"])
 
@@ -33,7 +62,7 @@ class CheckinIntegrationTests(unittest.TestCase):
         response = requests.Response()
         response.status_code = 403
         response._content = b'<html>challenge</html>'
-        with patch.object(session, "post", return_value=response):
+        with patch.object(checkin, "checkin_request", side_effect=requests.HTTPError(response=response)):
             outcome = checkin.checkin_account(session, None, 1)
         self.assertFalse(outcome["auth_failed"])
 
@@ -42,7 +71,7 @@ class CheckinIntegrationTests(unittest.TestCase):
         session.cookies.set("gld:sess", "valid")
         session.cookies.set("gld:sess.sig", "sig")
 
-        def remote(s, headers):
+        def remote(s, headers, *args):
             return {"code": 0, "message": "Got 1 points"} if s.cookies.get("gld:sess") == "valid" and "cookie" not in headers else {"code": -2}
 
         with patch.object(checkin, "checkin_request", side_effect=remote), \
@@ -65,7 +94,9 @@ class CheckinIntegrationTests(unittest.TestCase):
                 patch.object(checkin, "checkin_request", return_value={"code": 1}), \
                 patch.object(checkin, "api_get", side_effect=[
                     {"code": 0, "data": {"email": "first@gmail.com"}}, {"points": 1}]), \
+                patch.object(checkin, "BrowserCheckin") as browser, \
                 patch("glados_auth.GmailMailbox", side_effect=AssertionError("legacy mode opened mail")):
+            browser.return_value.__enter__.return_value.user_agent = "fixture browser"
             self.assertEqual(checkin.main(), 0)
 
     def test_wrong_account_status_stops_before_exchange(self):
@@ -133,6 +164,35 @@ class EmailAccountsTests(unittest.TestCase):
         self.assertEqual(outcomes[0]["result"], "repeat")
         self.assertEqual(self.store.get("first@gmail.com")["gld:sess"], "renewed")
         self.assertEqual(session.replies, [])
+
+    def test_cloudflare_business_failure_does_not_open_mailbox_or_delete_cache(self):
+        self.config.emails[:] = ["first@gmail.com"]
+        session = QueueSession([reply("GET", "/user/status", {
+            "code": 0, "data": {"email": "first@gmail.com"}})])
+        before = self.store.get("first@gmail.com")
+        with patch.object(checkin.requests, "Session", return_value=session), \
+                patch("glados_auth.GmailMailbox", side_effect=AssertionError("challenge opened mail")), \
+                patch.object(checkin, "checkin_account", return_value=result(1, "first@gmail.com", "fail")):
+            outcomes = checkin.run_email_accounts(self.config, self.store)
+        self.assertEqual(outcomes[0]["result"], "fail")
+        self.assertEqual(self.store.get("first@gmail.com"), before)
+
+    def test_challenge_diagnostic_does_not_send_mail_push_or_write_cache(self):
+        self.config.emails[:] = ["first@gmail.com"]
+        session = QueueSession([reply("GET", "/user/status", {
+            "code": 0, "data": {"email": "first@gmail.com"}})])
+        before = self.store.path.read_bytes()
+        driver = MagicMock()
+        driver.user_agent = "fixture browser"
+        driver.diagnose.return_value = {"code": 0, "challenge_loaded": True,
+                                       "turnstile_required": True, "turnstile_ready": True}
+        with patch.object(checkin.requests, "Session", return_value=session), \
+                patch.object(checkin, "BrowserCheckin") as constructor, \
+                patch.object(checkin, "push_all", side_effect=AssertionError("diagnostic pushed")), \
+                patch("glados_auth.GmailMailbox", side_effect=AssertionError("diagnostic sent mail")):
+            constructor.return_value.__enter__.return_value = driver
+            self.assertEqual(checkin.check_browser_challenges(self.config, self.store, []), 0)
+        self.assertEqual(self.store.path.read_bytes(), before)
 
 
 if __name__ == "__main__":

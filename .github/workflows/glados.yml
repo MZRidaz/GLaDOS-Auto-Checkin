@@ -2,6 +2,15 @@ name: GLaDOS Auto Checkin
 
 on:
   workflow_dispatch:  # 手动触发
+    inputs:
+      mode:
+        description: 运行方式（diagnose 只读检查，不签到、不发验证码、不兑换）
+        type: choice
+        default: checkin
+        options:
+          - checkin
+          - diagnose
+          - checkin-no-exchange
   schedule:
     - cron: '17 1 * * *'  # 每日 UTC 1:17 签到（北京时间 9:17）
     - cron: '0 0 1 * *'   # 每月 1 号保活空提交
@@ -33,8 +42,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt --no-cache-dir
 
+      - name: Install Chromium
+        run: python -m playwright install --with-deps --no-shell chromium
+
       - name: Run offline tests
         run: python -m unittest discover -s tests -v
+        env:
+          GLADOS_BROWSER_TESTS: '1'
 
       # 缓存中只有 Fernet 密文，解密密钥仅在签到步骤通过 Secrets 提供。
       - name: Restore encrypted cookies
@@ -45,10 +59,20 @@ jobs:
           key: glados-cookies-v1-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             glados-cookies-v1-${{ github.ref_name }}-
+            glados-cookies-v1-main-
 
       - name: Run checkin
-        run: python checkin.py
+        run: |
+          case "$RUN_MODE" in
+            diagnose) xvfb-run -a python checkin.py --check-challenge ;;
+            checkin-no-exchange) xvfb-run -a python checkin.py --no-exchange ;;
+            checkin) xvfb-run -a python checkin.py ;;
+            *) echo "Unknown run mode"; exit 1 ;;
+          esac
         env:
+          RUN_MODE: ${{ inputs.mode || 'checkin' }}
+          GLADOS_BROWSER_HEADLESS: 'false'
+          GLADOS_BROWSER_TIMEOUT: ${{ vars.GLADOS_BROWSER_TIMEOUT || '120' }}
           COOKIES: ${{ secrets.COOKIES || vars.COOKIES }}
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
@@ -74,7 +98,7 @@ jobs:
 
       # 即使某个账号失败，也保留其他账号已恢复的会话。每次使用新 key 保存。
       - name: Save encrypted cookies
-        if: always() && env.GLADOS_EMAILS != '' && hashFiles('.glados/cookies.enc') != ''
+        if: always() && inputs.mode != 'diagnose' && env.GLADOS_EMAILS != '' && hashFiles('.glados/cookies.enc') != ''
         uses: actions/cache/save@v4
         with:
           path: .glados/cookies.enc

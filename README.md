@@ -11,6 +11,7 @@
 - ✅ 每天自动签到，已签到自动识别
 - 📧 统一 Gmail 收件箱 + IMAP 应用专用密码：多账号 Cookie 失效后自动读取对应验证码重新登录
 - 🔐 新 Cookie 按邮箱隔离，用 Fernet 加密后缓存，下一次 Actions 继续使用，无需额外 GitHub PAT
+- 🌐 通过标准 Chromium 执行官网的签到 challenge / proof / Cloudflare Turnstile 流程
 - 👥 支持多账号：邮箱模式每行一个邮箱；Cookie 模式用 `|||`、`&` 或换行连接
 - 📊 查询总积分和剩余天数
 - 📬 8 种推送渠道：PushDeer / Server酱 / Telegram / PushPlus / 钉钉 / 飞书 / 企业微信 / 云湖
@@ -28,6 +29,7 @@
 ```
 .
 ├── checkin.py                 # 签到脚本
+├── browser_checkin.py         # 官网浏览器签到、账号隔离与只读验证诊断
 ├── glados_auth.py             # 多账号邮箱登录、只读 IMAP、加密 Cookie 存储
 ├── requirements.txt           # 运行依赖
 ├── tests/                     # 离线测试，不访问真实邮箱或 GLaDOS
@@ -42,6 +44,28 @@
 先将项目 Fork 到自己的 GitHub 仓库并启用 Actions，再选择以下一种认证方式。
 
 支持两种配置方式：推荐使用下面的**邮箱自动恢复模式**；原有 `COOKIES` 配置继续可用，配置方法在后文。配置 `GLADOS_EMAILS` 后优先使用邮箱模式，旧 `COOKIES` 不会按顺序绑定到邮箱，避免串号。
+
+邮箱模式优先读取每个账号的加密 Cookie 缓存；缺失或明确鉴权失效时才请求邮件验证码。邮箱配置错误或恢复失败不会回退到旧 `COOKIES`。切换到邮箱模式后可删除旧 `COOKIES`；要切回手动模式，删除或清空 `GLADOS_EMAILS` 并配置有效的 `COOKIES`。
+
+### 新签到验证与 GitHub Actions
+
+官网现在会先获取 `/api/user/checkin/challenge`，在页面中生成 proof，并按要求完成 Cloudflare Turnstile 验证，然后提交签到。脚本通过 Playwright 的标准 Chromium 点击官网签到按钮，让官网代码完成这些步骤，不再直接发送旧的固定 token 请求。
+
+Actions 会自动安装 Chromium 及系统依赖，并在 `xvfb` 虚拟显示器中运行有界面的浏览器，不需要配置桌面或额外的验证码服务。每个账号使用独立浏览器环境，登录、查询、签到使用相同的浏览器 User-Agent；更新后的 Cookie 仍保存到原有加密缓存。
+
+手动点击 **Actions → GLaDOS Auto Checkin → Run workflow** 时可选择 `mode`：
+
+| mode | 行为 |
+|------|------|
+| `checkin`（默认，定时任务也使用此模式） | 正常签到，按现有配置决定是否兑换积分 |
+| `diagnose` | 只检查已有缓存和官网验证是否自动就绪，不发验证码、不签到、不兑换、不写缓存 |
+| `checkin-no-exchange` | 正常签到并允许必要的邮箱恢复，本次强制关闭积分兑换 |
+
+Cloudflare 若未能自动完成验证，脚本会明确报错，保留会话并继续处理后续账号；不会因这一错误反复发验证码，也不会在签到失败后兑换积分。浏览器页面只允许本次签到写请求，其他兑换、游戏和登录写操作由浏览器拦截。实际兑换仍仅由 Python 按显式配置执行。
+
+**自动运行的边界**：标准浏览器能执行官网的验证流程，但 Cloudflare 仍可能要求人工交互，不能保证所有出口 IP 都能无人值守通过。遇到此情况，可先运行 `diagnose` 区分“缓存失效”和“浏览器验证未完成”，再在正常浏览器处理人工验证。不要把 Turnstile 令牌存成长期 Secret；令牌一次有效，且会很快过期。“已签到”的运行结果也不能证明当天新签到验证一定能通过。
+
+可选 Variable `GLADOS_BROWSER_TIMEOUT` 控制每个浏览器操作等待时间，默认 `120` 秒，可设 `30`–`300` 秒。测试分支没有缓存时可以读取 `main` 的已有密文缓存；保存仍使用当前分支独立的 key。
 
 ### 推荐：统一 Gmail 收件箱，自动恢复多个账号
 
@@ -125,6 +149,7 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 ```powershell
 python -m pip install -r requirements.txt
+python -m playwright install chromium
 
 $env:GLADOS_EMAILS = "account-a@gmail.com,account-b@gmail.com"
 $env:GMAIL_ADDRESS = "collector@gmail.com"
@@ -134,7 +159,7 @@ $env:COOKIE_STORE_KEY = [System.Net.NetworkCredential]::new("", (Read-Host "请�
 # 首次测试不兑换积分
 $env:EXCHANGE_PLAN = ""
 $env:GLADOS_EXCHANGE_PLAN = ""
-python checkin.py
+python checkin.py --no-exchange
 ```
 
 `Read-Host` 引号内是提示文字，不是配置值；运行后出现冒号时，再粘贴真实值并按回车，输入内容不会显示。此命令会实际登录和签到。保持同一密钥与缓存再次运行，正常应看到“Cookie 缓存有效，直接复用，不发送邮件验证码”。首次运行每个账号需要一封新验证码，缓存有效时不发码。
@@ -148,6 +173,8 @@ python checkin.py --check-session
 ```
 
 它只查询已有 Cookie 的登录状态，不发送验证码、不签到、不兑换，也不修改缓存。日志会显示缓存文件路径、是否成功解密，以及各账号缓存是缺失、有效还是被服务器拒绝。正常运行也会明确输出“Cookie 缓存有效，直接复用，不发送邮件验证码”或重新登录的原因。不要每次重新生成 `COOKIE_STORE_KEY`，也不要删除 `.glados`；切换运行目录时需确保使用同一缓存路径。
+
+排查新签到验证时用 `python checkin.py --check-challenge`。此命令启动浏览器但不会点击签到、不发邮件验证码、不兑换或更新缓存；缓存缺失时会明确报告，需要先正常运行一次才能检查。本地默认使用无界面 Chromium，需要观察页面时可先设置 `$env:GLADOS_BROWSER_HEADLESS = "false"`；Linux 有界面运行需要显示器或 `xvfb-run -a`。单纯 `--check-session` 不需要启动 Chromium。
 
 ### 原有方式：手动配置 Cookie
 
@@ -293,6 +320,12 @@ A: 可以，配置多个 Secrets 即可同时推送。
 ---
 
 ## 🔄 更新日志
+
+### v2.3.0
+
+- 通过官网 Chromium 页面执行新的签到 challenge、proof 和 Turnstile 流程；邮箱恢复、多账号和加密缓存继续保留。
+- 新增只读验证诊断、关闭兑换的单次测试模式和离线浏览器集成测试。
+- Cloudflare 失败保留会话，不触发邮件重登；签到失败后跳过积分兑换。
 
 ### v2.2.0
 

@@ -20,6 +20,7 @@ import requests
 from glados_auth import (
     AuthError, CookieStore, EmailAuthenticator, MailSettings, is_auth_failure, session_cookies,
 )
+from browser_checkin import BrowserCheckin, BrowserCheckinError
 
 # ==================== 日志配置 ====================
 logging.basicConfig(
@@ -45,7 +46,6 @@ HEADERS_BASE = {
     # 注意：使用 requests 的 json= 参数时会自动设置 Content-Type: application/json，
     # 此处无需（也不应）手动设置 content-type，否则与 requests 默认行为重复。
 }
-PAYLOAD = {"token": "glados.cloud"}
 TIMEOUT = (5, 15)  # (连接超时, 读取超时)
 MAX_RETRY = 3
 RETRY_MIN_WAIT = 2.0
@@ -591,11 +591,12 @@ def classify_checkin(code: Any, message: str) -> str:
     return "fail"
 
 
-@retry_on_failure()
-def checkin_request(session: requests.Session, headers: Dict[str, str]) -> Dict[str, Any]:
-    """执行签到请求（带重试）"""
-    r = session.post(CHECKIN_URL, headers=headers, json=PAYLOAD, timeout=TIMEOUT)
-    return core_response(r)
+def checkin_request(session, headers, browser=None, expected_email=None):
+    """执行官网签到流程；提交后状态未知时不盲目重试。"""
+    if browser is not None:
+        return browser.submit(session, headers, expected_email)
+    with BrowserCheckin() as driver:
+        return driver.submit(session, headers, expected_email)
 
 
 @retry_on_failure()
@@ -639,12 +640,15 @@ def checkin_account(
     index: int,
     exchange_plan: Optional[str] = None,
     expected_email: Optional[str] = None,
+    browser=None,
 ) -> Dict[str, Any]:
     """执行单个账号的签到，返回账号信息字典
 
     exchange_plan: 积分兑换计划名（plan100/plan200/plan500），为 None 时不兑换。
     """
     headers = {**HEADERS_BASE}
+    if browser is not None:
+        headers["user-agent"] = browser.user_agent
     if cookie is not None:
         session.cookies.clear()  # 兼容旧 COOKIES 模式
         headers["cookie"] = cookie
@@ -661,7 +665,8 @@ def checkin_account(
 
     try:
         # 1. 签到
-        j = checkin_request(session, headers)
+        j = (checkin_request(session, headers, browser, expected_email) if browser is not None
+             else checkin_request(session, headers))
         if is_auth_failure(j):
             auth_failed = True
             raise AuthError("登录会话失效或设备不一致，请重新登录")
@@ -669,7 +674,9 @@ def checkin_account(
         message = j.get("message", "")
         # H1：GLaDOS 不返回 points 字段，从 message 文本解析本次获得积分
         earned = parse_earned_points(message)
-        result = classify_checkin(code, message)
+        result = "repeat" if code in (0, "0") and j.get("repeated") is True else classify_checkin(code, message)
+        if result == "ok" and isinstance(j.get("points"), (int, float)):
+            earned = int(j["points"])
 
         if result == "ok":
             status = f"✅ 成功 (+{earned}积分)"
@@ -678,7 +685,10 @@ def checkin_account(
         else:
             # 区分「服务端鉴权失败」与「其它业务失败」：鉴权失败通常是 Cookie 过期/
             # 复制不完整，需要给出「重新获取 Cookie」的可操作提示，避免与格式问题混淆。
-            if any(kw in (message or "").lower() for kw in AUTH_FAIL_KEYWORDS):
+            if j.get("reason") == "turnstile":
+                status = "❌ Cloudflare 验证未通过，请用 --check-challenge 排查或在官网完成人工验证"
+                logger.warning("账号 %d Cloudflare 验证失败，保留 Cookie，不触发邮箱重登", index)
+            elif any(kw in (message or "").lower() for kw in AUTH_FAIL_KEYWORDS):
                 status = f"❌ 鉴权失败({message}) → 请重新获取 Cookie"
                 logger.warning("账号 %d 鉴权失败，Cookie 可能已过期或复制不完整: %s", index, message)
             else:
@@ -730,11 +740,13 @@ def checkin_account(
             logger.warning("账号 %d 积分查询失败: %s", index, e)
 
         # 4. 积分兑换（#9，仅配置了 EXCHANGE_PLAN 时执行；默认关闭不影响现有功能）
-        #    兑换独立于签到结果，但仅在成功查到积分后尝试；失败不影响签到状态/退出码。
+        #    只有签到成功或已签到且成功查到积分后尝试；失败不影响签到状态/退出码。
         if exchange_plan and exchange_plan in EXCHANGE_PLANS:
             req_pts = EXCHANGE_PLANS[exchange_plan]["points"]
             days_gain = EXCHANGE_PLANS[exchange_plan]["days"]
-            if total_points_int is None:
+            if result not in ("ok", "repeat"):
+                exchange_status = "⚠️ 兑换跳过(签到未成功)"
+            elif total_points_int is None:
                 exchange_status = "⚠️ 兑换跳过(积分查询失败)"
                 logger.warning("账号 %d 积分查询失败，跳过兑换", index)
             elif total_points_int < req_pts:
@@ -758,7 +770,7 @@ def checkin_account(
                     exchange_status = f"⚠️ 兑换异常({type(e).__name__})"
                     logger.warning("账号 %d 积分兑换异常: %s", index, e)
 
-    except AuthError as e:
+    except (AuthError, BrowserCheckinError) as e:
         status = f"❌ {e}"
         result = "fail"
         logger.warning("账号 %d: %s", index, e)
@@ -785,20 +797,23 @@ def failed_account(index, email, message):
             "auth_failed": False}
 
 
-def run_email_accounts(settings, store, exchange_plan=None):
-    authenticator = EmailAuthenticator(settings, store, HEADERS_BASE)
+def run_email_accounts(settings, store, exchange_plan=None, browser=None):
+    headers = {**HEADERS_BASE}
+    if browser is not None:
+        headers["user-agent"] = browser.user_agent
+    authenticator = EmailAuthenticator(settings, store, headers)
     accounts = []
     for index, email in enumerate(settings.emails, 1):
         logger.info("正在处理邮箱账号 %d/%d (%s)...", index, len(settings.emails), mask_email(email))
         try:
             with requests.Session() as session:
                 logged_in = authenticator.prepare(session, email)
-                acc = checkin_account(session, None, index, exchange_plan, expected_email=email)
+                acc = checkin_account(session, None, index, exchange_plan, expected_email=email, browser=browser)
                 if acc.get("auth_failed"):
                     store.remove(email)
                     if not logged_in:  # 本轮最多执行一次邮箱登录，避免循环发码
                         authenticator.login(session, email)
-                        acc = checkin_account(session, None, index, exchange_plan, expected_email=email)
+                        acc = checkin_account(session, None, index, exchange_plan, expected_email=email, browser=browser)
                 if acc.get("auth_failed"):
                     store.remove(email)
                 elif acc["result"] in ("ok", "repeat"):
@@ -838,7 +853,7 @@ def check_cached_sessions(settings, store):
     return int(failed)
 
 
-def run_cookie_accounts(cookies, exchange_plan):
+def run_cookie_accounts(cookies, exchange_plan, browser=None):
     accounts = []
     with requests.Session() as session:
         for index, cookie in enumerate(cookies, 1):
@@ -848,14 +863,50 @@ def run_cookie_accounts(cookies, exchange_plan):
                 accounts.append(failed_account(index, "[无效Cookie]", error))
             else:
                 logger.info("账号 %d 会话前缀识别为: %s:", index, extract_session_prefix(cookie))
-                accounts.append(checkin_account(session, cookie, index, exchange_plan))
+                accounts.append(checkin_account(session, cookie, index, exchange_plan, browser=browser))
             if index < len(cookies):
                 time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
     return accounts
 
 
 # ==================== 主流程 ====================
-def main(check_session=False) -> int:
+def check_browser_challenges(settings, store, cookies):
+    """只检查已缓存会话与页面验证；不登录、不签到、不兑换、不写缓存。"""
+    failed = False
+    with BrowserCheckin() as browser:
+        headers = {**HEADERS_BASE, "user-agent": browser.user_agent}
+        authenticator = EmailAuthenticator(settings, store, headers) if settings else None
+        entries = settings.emails if settings else cookies
+        for index, entry in enumerate(entries, 1):
+            with requests.Session() as session:
+                try:
+                    if settings:
+                        if authenticator.cached_status(session, entry) != "valid":
+                            logger.warning("账号 %d 缓存缺失或登录已失效；只读诊断不请求验证码", index)
+                            failed = True
+                            continue
+                    else:
+                        valid, _ = validate_cookie(entry)
+                        if not valid:
+                            logger.warning("账号 %d Cookie 格式无效", index)
+                            failed = True
+                            continue
+                        headers["cookie"] = entry
+                    result = browser.diagnose(session, headers, entry if settings else None)
+                    passed = result.get("code") == 0 and result.get("challenge_loaded") and (
+                        not result.get("turnstile_required") or result.get("turnstile_ready"))
+                    logger.info("账号 %d 验证诊断: challenge=%s, Turnstile=%s, 自动验证=%s",
+                                index, bool(result.get("challenge_loaded")),
+                                bool(result.get("turnstile_required")), "就绪" if passed else "未完成")
+                    failed |= not passed
+                except (AuthError, BrowserCheckinError) as error:
+                    logger.warning("账号 %d 验证诊断失败: %s", index, error)
+                    failed = True
+    logger.info("只读验证诊断结束：未发验证码、未签到、未兑换、未修改缓存")
+    return int(failed)
+
+
+def main(check_session=False, check_challenge=False, no_exchange=False) -> int:
     # H2：支持 ||| 或换行(\n)或 & 分隔多账号 Cookie；推荐使用 ||| 避免与 Cookie 值冲突
     raw = os.getenv("COOKIES", "")
     # 先归一化（剥离空白/引号/"Cookie:" 头名）再过滤空串，避免粘贴杂质导致误判
@@ -874,11 +925,21 @@ def main(check_session=False) -> int:
             return 1
         return check_cached_sessions(mail_settings, store)
 
+    if check_challenge:
+        if not mail_settings and not cookies:
+            logger.error("验证诊断需要配置邮箱模式或 COOKIES")
+            return 1
+        try:
+            return check_browser_challenges(mail_settings, store, cookies)
+        except BrowserCheckinError as error:
+            logger.error("验证诊断失败: %s", error)
+            return 1
+
     if store:
         logger.info("Cookie 缓存路径: %s", store.path.resolve())
 
     # #9：积分兑换计划（可选，默认关闭；仅显式配置且值合法时启用，避免静默消耗积分）
-    raw_plan = (os.getenv("EXCHANGE_PLAN") or os.getenv("GLADOS_EXCHANGE_PLAN") or "").strip()
+    raw_plan = "" if no_exchange else (os.getenv("EXCHANGE_PLAN") or os.getenv("GLADOS_EXCHANGE_PLAN") or "").strip()
     if raw_plan:
         if raw_plan in EXCHANGE_PLANS:
             exchange_plan = raw_plan
@@ -906,7 +967,14 @@ def main(check_session=False) -> int:
     ok = fail = repeat = 0
     lines = []
 
-    accounts = run_email_accounts(mail_settings, store, exchange_plan) if mail_settings else run_cookie_accounts(cookies, exchange_plan)
+    try:
+        with BrowserCheckin() as browser:
+            accounts = (run_email_accounts(mail_settings, store, exchange_plan, browser=browser)
+                        if mail_settings else run_cookie_accounts(cookies, exchange_plan, browser=browser))
+    except BrowserCheckinError as error:
+        logger.error("浏览器签到初始化失败: %s", error)
+        push_all("GLaDOS 签到失败", str(error))
+        return 1
     for acc in accounts:
         if acc["result"] == "ok":
             ok += 1
@@ -948,6 +1016,12 @@ def main(check_session=False) -> int:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="GLaDOS 多账号自动签到")
-    parser.add_argument("--check-session", action="store_true",
+    diagnostic = parser.add_mutually_exclusive_group()
+    diagnostic.add_argument("--check-session", action="store_true",
                         help="只检查缓存登录状态，不发验证码、不签到、不兑换")
-    sys.exit(main(check_session=parser.parse_args().check_session))
+    diagnostic.add_argument("--check-challenge", action="store_true",
+                            help="只检查缓存会话及官网浏览器验证，不发验证码、不签到、不兑换")
+    parser.add_argument("--no-exchange", action="store_true", help="本次运行强制关闭积分兑换")
+    args = parser.parse_args()
+    sys.exit(main(check_session=args.check_session, check_challenge=args.check_challenge,
+                  no_exchange=args.no_exchange))
