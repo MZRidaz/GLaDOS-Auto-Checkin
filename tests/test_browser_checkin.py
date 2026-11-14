@@ -30,7 +30,7 @@ class BrowserContractTests(unittest.TestCase):
 
     def test_invalid_browser_settings_fail_before_opening_any_mailbox(self):
         for env in ({"GLADOS_BROWSER_HEADLESS": "invalid"}, {"GLADOS_BROWSER_TIMEOUT": "-1"},
-                    {"GLADOS_BROWSER_CHANNEL": "invalid"}):
+                    {"GLADOS_BROWSER_CHANNEL": "invalid"}, {"GLADOS_BROWSER_LAUNCH": "invalid"}):
             with self.subTest(env=env), patch.dict(os.environ, env, clear=True):
                 with self.assertRaises(browser.BrowserCheckinError):
                     browser.BrowserCheckin()
@@ -208,6 +208,31 @@ class BrowserFlowTests(unittest.TestCase):
             self.driver.submit(self.session, {}, "first@example.com")
         self.assertLess(time.monotonic() - started, 3.9)
         self.assertEqual(len(self.server.posts), 1)
+
+
+@unittest.skipUnless(os.getenv("GLADOS_BROWSER_TESTS") == "1", "启用 GLADOS_BROWSER_TESTS=1 运行原生浏览器测试")
+class NativeBrowserTests(unittest.TestCase):
+    def test_native_browser_uses_its_own_profile_and_cleans_up(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Fixture)
+        server.gets, server.posts = [], []
+        server.background, server.stall = False, False
+        server.token = "fixture-token"
+        server.status = {"code": 0, "data": {"email": "first@example.com"}}
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with patch.object(browser, "ORIGIN", "http://127.0.0.1:%d" % server.server_port), \
+                    patch.dict(os.environ, {"GLADOS_BROWSER_LAUNCH": "native", "GLADOS_BROWSER_CHANNEL": "chromium"}):
+                with browser.BrowserCheckin(headless=True, timeout_ms=10000) as native:
+                    self.assertIsNotNone(native.process)
+                    profile = native.profile.name
+                    with requests.Session() as session:
+                        result = native.diagnose(session, {}, "first@example.com")
+                    self.assertTrue(result["turnstile_ready"])
+                self.assertIsNotNone(native.process.poll())
+                self.assertFalse(os.path.exists(profile))
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":

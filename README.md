@@ -53,6 +53,8 @@
 
 Actions 会自动安装浏览器系统依赖和离线测试所需的 Chromium，实际签到使用 runner 自带的稳定版 Chrome，在 `xvfb` 虚拟显示器中以有界面模式运行，不需要配置桌面或额外的验证码服务。每个账号使用独立浏览器环境，登录、查询、签到使用相同的浏览器 User-Agent；更新后的 Cookie 仍保存到原有加密缓存。
 
+Actions 使用 `GLADOS_BROWSER_LAUNCH=native`：独立启动自己的 Chrome，再通过仅监听本机的 DevTools 连接控制。使用随机临时 profile，退出时删除，不接管个人浏览器，不修改浏览器验证属性。没有第三方解码服务或伪造令牌。本地默认由 Playwright 启动，也可设置该变量对比原生启动；原生 Chrome / Edge 需能在 PATH 中找到，Chromium 使用 Playwright 安装路径。
+
 手动点击 **Actions → GLaDOS Auto Checkin → Run workflow** 时可选择 `mode`：
 
 | mode | 行为 |

@@ -74,6 +74,7 @@ jobs:
           RUN_MODE: ${{ inputs.mode || 'checkin' }}
           GLADOS_BROWSER_HEADLESS: 'false'
           GLADOS_BROWSER_CHANNEL: 'chrome'
+          GLADOS_BROWSER_LAUNCH: 'native'
           GLADOS_DIAGNOSTIC_SCREENSHOTS: ${{ inputs.mode == 'diagnose' && 'true' || 'false' }}
           GLADOS_BROWSER_TIMEOUT: ${{ vars.GLADOS_BROWSER_TIMEOUT || '120' }}
           COOKIES: ${{ secrets.COOKIES || vars.COOKIES }}

@@ -2,6 +2,12 @@
 import logging
 import os
 import re
+import shutil
+import socket
+import subprocess
+import tempfile
+import time
+import urllib.request
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -44,6 +50,9 @@ class BrowserCheckin:
     """共享 Chromium 进程，每次签到创建独立、用后即关的账号 context。"""
 
     def __init__(self, *, headless=None, timeout_ms=None):
+        self.launch_mode = os.getenv("GLADOS_BROWSER_LAUNCH", "playwright").strip().lower()
+        if self.launch_mode not in ("playwright", "native"):
+            raise BrowserCheckinError("GLADOS_BROWSER_LAUNCH 必须为 playwright 或 native")
         self.channel = os.getenv("GLADOS_BROWSER_CHANNEL", "chromium").strip().lower()
         if self.channel not in ("chromium", "chrome", "msedge"):
             raise BrowserCheckinError("GLADOS_BROWSER_CHANNEL 必须为 chromium、chrome 或 msedge")
@@ -62,6 +71,44 @@ class BrowserCheckin:
         self.timeout_ms = timeout_ms
         self.runtime = None
         self.browser = None
+        self.process = None
+        self.profile = None
+
+    def _launch_native(self):
+        if self.channel == "chromium":
+            executable = self.runtime.chromium.executable_path
+        else:
+            names = ("google-chrome", "google-chrome-stable", "chrome", "chrome.exe") if self.channel == "chrome" else ("microsoft-edge", "msedge", "msedge.exe")
+            executable = next((path for name in names if (path := shutil.which(name))), None)
+            if not executable:
+                raise BrowserCheckinError("所选原生浏览器不在 PATH 中")
+        self.profile = tempfile.TemporaryDirectory(prefix="glados-chrome-")
+        # 使用已分配的非零 loopback 端口；不开放远程连接，也不接管用户浏览器。
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+        args = [executable, f"--user-data-dir={self.profile.name}",
+                f"--remote-debugging-port={port}", "--remote-debugging-address=127.0.0.1",
+                "--no-first-run", "--no-default-browser-check", "about:blank"]
+        if self.headless:
+            args.insert(1, "--headless=new")
+        if os.getenv("CI") == "true":
+            args.insert(1, "--no-sandbox")  # 与 Playwright 在隔离 CI 中的默认启动方式一致。
+        self.process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        endpoint = f"http://127.0.0.1:{port}"
+        deadline = time.monotonic() + self.timeout_ms / 1000
+        while time.monotonic() < deadline:
+            if self.process.poll() is not None:
+                break
+            try:
+                # readiness 只连接自己创建的本机浏览器，不记录调试地址或 profile 内容。
+                with urllib.request.urlopen(endpoint + "/json/version", timeout=1) as response:
+                    if response.status == 200:
+                        return self.runtime.chromium.connect_over_cdp(endpoint, timeout=self.timeout_ms)
+            except OSError:
+                time.sleep(0.1)
+        raise BrowserCheckinError("原生 Chrome 启动超时或提前退出")
 
     def __enter__(self):
         try:
@@ -70,7 +117,8 @@ class BrowserCheckin:
             raise BrowserCheckinError("请安装 requirements.txt 依赖及 Chromium：python -m playwright install chromium") from None
         try:
             self.runtime = sync_playwright().start()
-            self.browser = self.runtime.chromium.launch(headless=self.headless, channel=self.channel)
+            self.browser = (self._launch_native() if self.launch_mode == "native" else
+                            self.runtime.chromium.launch(headless=self.headless, channel=self.channel))
             page = self.browser.new_page()
             self.user_agent = page.evaluate("navigator.userAgent")
             page.close()
@@ -84,8 +132,23 @@ class BrowserCheckin:
             if self.browser:
                 self.browser.close()
         finally:
-            if self.runtime:
-                self.runtime.stop()
+            try:
+                if self.runtime:
+                    self.runtime.stop()
+            finally:
+                if self.process and self.process.poll() is None:
+                    self.process.terminate()
+                    try:
+                        self.process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        self.process.kill()
+                        self.process.wait(timeout=5)
+                if self.profile:
+                    profile_path = Path(self.profile.name).resolve()
+                    if (profile_path.parent != Path(tempfile.gettempdir()).resolve()
+                            or not profile_path.name.startswith("glados-chrome-")):
+                        raise BrowserCheckinError("浏览器临时目录边界检查失败，已跳过清理")
+                    self.profile.cleanup()
 
     def _run(self, session, headers, expected_email, readonly):
         context = self.browser.new_context(user_agent=self.user_agent, locale="en-US",
@@ -187,7 +250,7 @@ class BrowserCheckin:
                             folder = Path(".glados/diagnostics")
                             folder.mkdir(parents=True, exist_ok=True)
                             self._capture_index = getattr(self, "_capture_index", 0) + 1
-                            frame.screenshot(path=str(folder / f"turnstile-{self._capture_index}.png"))
+                            frame.screenshot(path=str(folder / f"turnstile-{self._capture_index}.png"), timeout=5000)
                             break
                 return {"code": 0, "challenge_loaded": challenge.get("code") == 0 and bool(challenge.get("nonce")),
                         "turnstile_required": bool(challenge.get("turnstile")), "turnstile_ready": ready,
