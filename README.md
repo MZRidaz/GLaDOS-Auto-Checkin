@@ -59,6 +59,7 @@
 - **切换回手动 Cookie 模式**：删除或清空 `GLADOS_EMAILS`，再设置有效的 `COOKIES`。其他 Gmail 配置及加密缓存无需删除，手动模式不会使用它们。Cookie 失效后需要自行重新获取并更新 `COOKIES`。
 
 GitHub Actions 中请在仓库 **Settings → Secrets and variables → Actions** 修改上述配置；本地运行则修改当前终端中的同名环境变量。
+
 ### 新签到验证与 GitHub Actions
 
 **正常运行无需手动验证。** Actions 会启动浏览器完成官网的 challenge、proof 和 Cloudflare Turnstile 验证，再提交签到；出现标准的 “Verify you are human” 勾选框时，会自动进行一次正常勾选并等待官方令牌。无需自托管服务器或第三方验证码服务。
@@ -349,7 +350,9 @@ A: 可以，配置多个 Secrets 即可同时推送。
 
 - 通过官网 Chromium 页面执行新的签到 challenge、proof 和 Turnstile 流程；邮箱恢复、多账号和加密缓存继续保留。
 - 新增只读验证诊断、关闭兑换的单次测试模式和离线浏览器集成测试。
+- 自动完成 Cloudflare 标准验证勾选框，正常运行无需手动验证；已在 GitHub 托管 Ubuntu 验证四账号新签到及连续缓存复用。
 - Cloudflare 失败保留会话，不触发邮件重登；签到失败后跳过积分兑换。
+- 整合上游 challenge 修复（#26 / #27）；由官网浏览器流程统一完成验证，取代 Python 手算 proof 与旧协议回退。
 
 ### v2.2.0
 
@@ -359,6 +362,16 @@ A: 可以，配置多个 Secrets 即可同时推送。
 - 增加离线测试；Actions 启动签到前自动运行测试。
 
 本地验证命令：`python -m unittest discover -s tests -v`。测试使用模拟 HTTP/IMAP，不发验证码、不访问真实账号，也不消耗积分。
+
+### v2.1.2
+
+以下为该版本的历史行为，当前 v2.3.0 已改用上述官网浏览器验证流程，不再回退旧协议。
+
+**问题修复**
+- 修复签到只获得 1 积分的问题（#26）：GLaDOS 官网签到新增了 challenge 验证，脚本直接提交会被服务端判定为自动签到、只发保底 1 分。现在签到前会先请求 `/api/user/checkin/challenge` 取得一次性 nonce，等待约 2.6 秒后以 `sha256(nonce + ".glados-observe-v1")` 计算 proof 并随签到一并提交，与官网前端流程一致
+- challenge 获取失败（网络异常、响应异常、ttl 不足）时自动回退旧协议提交并输出告警日志，不会因此导致签到中断；每次重试都会重新获取新的 nonce
+
+---
 
 ### v2.1.1
 
