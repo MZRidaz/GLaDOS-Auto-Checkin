@@ -1,0 +1,300 @@
+"""离线测试：本机 fixture 模拟官网，不连接 GLaDOS 或 Cloudflare。"""
+import json
+import os
+import threading
+import time
+import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
+
+import requests
+
+try:
+    import browser_checkin as browser
+except ImportError:
+    browser = None
+
+
+class BrowserContractTests(unittest.TestCase):
+    def test_browser_transport_is_available(self):
+        self.assertIsNotNone(browser, "尚未实现官网浏览器签到适配")
+
+    def test_only_target_host_cookies_are_imported_and_legacy_header_takes_precedence(self):
+        session = requests.Session()
+        session.cookies.set("gld:sess", "own", domain="glados.cloud")
+        session.cookies.set("foreign", "do-not-copy", domain="other.example")
+        cookies = browser._cookies_for_browser(session, {})
+        self.assertEqual([c["name"] for c in cookies], ["gld:sess"])
+        cookies = browser._cookies_for_browser(session, {"cookie": "gld:sess=legacy==; gld:sess.sig=sig"})
+        self.assertEqual([c["value"] for c in cookies], ["legacy==", "sig"])
+
+    def test_invalid_browser_settings_fail_before_opening_any_mailbox(self):
+        for env in ({"GLADOS_BROWSER_HEADLESS": "invalid"}, {"GLADOS_BROWSER_TIMEOUT": "-1"},
+                    {"GLADOS_BROWSER_CHANNEL": "invalid"}, {"GLADOS_BROWSER_LAUNCH": "invalid"}):
+            with self.subTest(env=env), patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(browser.BrowserCheckinError):
+                    browser.BrowserCheckin()
+
+
+PAGE = """<!doctype html><html><body>
+<input type="hidden" name="cf-turnstile-response" value="TOKEN">
+<button class="ckb" disabled>Check in</button>
+<script>
+fetch('/api/user/checkin/challenge').then(r=>r.json()).then(c=>{
+ const button=document.querySelector('.ckb');button.disabled=false;
+ button.onclick=async()=>{
+   button.disabled=true;
+   fetch('/api/user/exchange',{method:'POST',body:'blocked'}).catch(()=>{});
+   const payload={token:location.hostname,nonce:c.nonce,
+     proof:'fixture-proof:'+c.nonce,tsState:'ok',
+     turnstile:document.querySelector('input').value};
+   const r=await fetch('/api/user/checkin',{method:'POST',
+     headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+   const result=await r.json();button.textContent=result.message;
+ };
+});
+</script></body></html>"""
+
+
+class Fixture(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def respond(self, payload, status=200, content_type="application/json", cookie=None):
+        raw = payload.encode() if isinstance(payload, str) else json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(raw)))
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self):
+        self.server.gets.append((self.path, self.headers.get("Cookie", "")))
+        if self.path == "/api/user/status":
+            self.respond(self.server.status)
+        elif self.path == "/api/user/checkin/challenge":
+            self.respond({"code": 0, "nonce": "test-nonce", "ttl": 300000,
+                          "turnstile": "test-sitekey"})
+        elif self.path == "/console/checkin":
+            page = PAGE.replace("TOKEN", self.server.token)
+            if self.server.api_token:
+                page = page.replace("<script>", "<script>window.turnstile={getResponse:()=> 'fixture-api-token'};")
+            if self.server.below_fold:
+                page = page.replace('<input type="hidden"', '<div style="height:2000px"></div><input type="hidden"')
+                page = page.replace("<script>", "<script>addEventListener('scroll',()=>{document.querySelector('input').value='visible-token'});")
+            if self.server.background:
+                page = page.replace("<script>", "<script>fetch('/api/user/checkin',{method:'POST',body:'background'}).catch(()=>{});")
+            if self.server.checkbox:
+                page = page.replace("<script>", """<div id="verification"></div><script>
+                    document.querySelector('#verification').attachShadow({mode:'closed'}).innerHTML =
+                        '<iframe width="300" height="65" src="/widget"></iframe>';
+                    addEventListener('message',event=>{
+                        if(event.origin===location.origin && event.data==='fixture-verified')
+                            document.querySelector('input').value='fixture-completed-token';
+                    });
+                """)
+            self.respond(page, content_type="text/html")
+        elif self.path == "/widget":
+            self.respond("""<div id="root"></div><script>
+                const root=document.querySelector('#root').attachShadow({mode:'closed'});
+                root.innerHTML='<label><input type="checkbox" aria-label="Verify you are human">Verify you are human</label>';
+                root.querySelector('input').onchange=()=>parent.postMessage('fixture-verified',location.origin);
+            </script>""", content_type="text/html")
+        else:
+            self.respond({}, 404)
+
+    def do_POST(self):
+        data = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self.server.posts.append((self.path, data))
+        if self.path == "/api/user/checkin":
+            if self.server.stall:
+                self.send_response(200)
+                self.send_header("Content-Length", "100")
+                self.end_headers()
+                self.wfile.write(b'{')
+                self.wfile.flush()
+                time.sleep(4)
+                return
+            self.respond(self.server.result, cookie="gld:sess=rotated; Path=/")
+        else:
+            self.respond({"code": 0})
+
+
+@unittest.skipUnless(os.getenv("GLADOS_BROWSER_TESTS") == "1", "启用 GLADOS_BROWSER_TESTS=1 运行离线 Chromium 测试")
+class BrowserFlowTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if browser is None:
+            raise AssertionError("尚未实现官网浏览器签到适配")
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Fixture)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.origin = "http://127.0.0.1:%d" % cls.server.server_port
+        cls.origin_patch = patch.object(browser, "ORIGIN", cls.origin)
+        cls.origin_patch.start()
+        cls.driver = browser.BrowserCheckin(headless=True, timeout_ms=3000)
+        cls.driver.__enter__()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.driver.__exit__(None, None, None)
+        cls.origin_patch.stop()
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def setUp(self):
+        self.server.posts = []
+        self.server.gets = []
+        self.server.status = {"code": 0, "data": {"email": "first@example.com"}}
+        self.server.result = {"code": 0, "points": 7, "message": "Got 7 points"}
+        self.server.token = "fixture-token"
+        self.server.api_token = False
+        self.server.below_fold = False
+        self.server.checkbox = False
+        self.server.background = False
+        self.server.stall = False
+        self.session = requests.Session()
+        self.session.cookies.set("gld:sess", "original", domain="127.0.0.1", path="/")
+        self.session.cookies.set("gld:sess.sig", "sig", domain="127.0.0.1", path="/")
+
+    def tearDown(self):
+        self.session.close()
+
+    def test_official_page_builds_payload_and_other_writes_are_blocked(self):
+        result = self.driver.submit(self.session, {}, "first@example.com")
+        self.assertEqual(result["code"], 0)
+        self.assertEqual(len(self.server.posts), 1)
+        path, raw = self.server.posts[0]
+        self.assertEqual(path, "/api/user/checkin")
+        self.assertEqual(json.loads(raw)["proof"], "fixture-proof:test-nonce")
+        self.assertEqual(json.loads(raw)["turnstile"], "fixture-token")
+        self.assertEqual(self.session.cookies.get("gld:sess"), "rotated")
+
+    def test_wrong_identity_stops_before_any_post(self):
+        with self.assertRaisesRegex(browser.BrowserCheckinError, "身份"):
+            self.driver.submit(self.session, {}, "other@example.com")
+        self.assertEqual(self.server.posts, [])
+
+    def test_expired_session_is_returned_for_existing_mail_recovery(self):
+        self.server.status = {"code": -2, "message": "unauthorized"}
+        result = self.driver.submit(self.session, {}, "first@example.com")
+        self.assertEqual(result["code"], -2)
+        self.assertEqual(self.server.posts, [])
+
+    def test_turnstile_rejection_is_not_retried_or_classified_as_auth(self):
+        self.server.result = {"code": 4, "reason": "turnstile", "message": "Cloudflare verification failed"}
+        result = self.driver.submit(self.session, {}, "first@example.com")
+        self.assertEqual(result["reason"], "turnstile")
+        self.assertEqual(len(self.server.posts), 1)
+
+    def test_readonly_diagnostic_observes_challenge_without_post_or_cookie_update(self):
+        before = list(self.session.cookies)
+        result = self.driver.diagnose(self.session, {}, "first@example.com")
+        self.assertTrue(result["challenge_loaded"])
+        self.assertTrue(result["turnstile_required"])
+        self.assertTrue(result["turnstile_ready"])
+        self.assertEqual(self.server.posts, [])
+        self.assertEqual(list(self.session.cookies), before)
+
+    def test_diagnostic_reports_unfinished_turnstile_without_claiming_success(self):
+        self.server.token = ""
+        result = self.driver.diagnose(self.session, {}, "first@example.com")
+        self.assertFalse(result["turnstile_ready"])
+        self.assertEqual(self.server.posts, [])
+
+    def test_diagnostic_uses_public_widget_api_when_response_field_is_empty(self):
+        self.server.token = ""
+        self.server.api_token = True
+        result = self.driver.diagnose(self.session, {}, "first@example.com")
+        self.assertTrue(result["turnstile_ready"])
+        self.assertEqual(self.server.posts, [])
+
+    def test_diagnostic_scrolls_verification_area_into_view_without_clicking(self):
+        self.server.token = ""
+        self.server.below_fold = True
+        result = self.driver.diagnose(self.session, {}, "first@example.com")
+        self.assertTrue(result["turnstile_ready"])
+        self.assertEqual(self.server.posts, [])
+
+    def test_verification_box_can_be_located_inside_closed_shadow_dom(self):
+        with self.driver.browser.new_context() as context:
+            page = context.new_page()
+            page.set_content('<div id="widget"></div>')
+            page.evaluate("""url => {
+                const shadow = document.querySelector('#widget').attachShadow({mode:'closed'});
+                shadow.innerHTML = '<iframe width="300" height="65" src="' + url + '"></iframe>';
+            }""", self.origin + "/widget")
+            boxes = browser._verification_boxes(page, hostname="127.0.0.1")
+        self.assertEqual(len(boxes), 1)
+        self.assertEqual(boxes[0]["width"], 300)
+        self.assertEqual(boxes[0]["height"], 65)
+
+    def test_standard_verification_checkbox_is_completed_without_business_post(self):
+        self.server.token = ""
+        self.server.checkbox = True
+        with patch.object(browser, "TURNSTILE_HOST", "127.0.0.1", create=True):
+            result = self.driver.diagnose(self.session, {}, "first@example.com")
+        self.assertTrue(result["turnstile_ready"])
+        self.assertEqual(self.server.posts, [])
+
+    def test_account_context_does_not_leak_cookies_to_next_account(self):
+        self.driver.submit(self.session, {}, "first@example.com")
+        empty = requests.Session()
+        self.driver.diagnose(empty, {}, "first@example.com")
+        self.assertEqual(list(empty.cookies), [])
+        self.assertEqual([c for path, c in self.server.gets if path == "/api/user/status"][-1], "")
+
+    def test_unreadable_post_response_is_not_retried(self):
+        self.server.result = "not JSON"
+        with self.assertRaisesRegex(browser.BrowserCheckinError, "不自动重复提交"):
+            self.driver.submit(self.session, {}, "first@example.com")
+        self.assertEqual(len(self.server.posts), 1)
+
+    def test_background_checkin_is_blocked_until_button_is_clicked(self):
+        self.server.background = True
+        result = self.driver.submit(self.session, {}, "first@example.com")
+        self.assertEqual(result["code"], 0)
+        self.assertEqual(len(self.server.posts), 1)
+        self.assertEqual(json.loads(self.server.posts[0][1])["proof"], "fixture-proof:test-nonce")
+
+    def test_stalled_response_body_times_out_without_another_submission(self):
+        self.server.stall = True
+        started = time.monotonic()
+        with self.assertRaisesRegex(browser.BrowserCheckinError, "未能确认结果"):
+            self.driver.submit(self.session, {}, "first@example.com")
+        self.assertLess(time.monotonic() - started, 3.9)
+        self.assertEqual(len(self.server.posts), 1)
+
+
+@unittest.skipUnless(os.getenv("GLADOS_BROWSER_TESTS") == "1", "启用 GLADOS_BROWSER_TESTS=1 运行原生浏览器测试")
+class NativeBrowserTests(unittest.TestCase):
+    def test_native_browser_uses_its_own_profile_and_cleans_up(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Fixture)
+        server.gets, server.posts = [], []
+        server.background, server.stall = False, False
+        server.token = "fixture-token"
+        server.api_token = False
+        server.below_fold = False
+        server.checkbox = False
+        server.status = {"code": 0, "data": {"email": "first@example.com"}}
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with patch.object(browser, "ORIGIN", "http://127.0.0.1:%d" % server.server_port), \
+                    patch.dict(os.environ, {"GLADOS_BROWSER_LAUNCH": "native", "GLADOS_BROWSER_CHANNEL": "chromium"}):
+                with browser.BrowserCheckin(headless=True, timeout_ms=10000) as native:
+                    self.assertIsNotNone(native.process)
+                    profile = native.profile.name
+                    with requests.Session() as session:
+                        result = native.diagnose(session, {}, "first@example.com")
+                    self.assertTrue(result["turnstile_ready"])
+                self.assertIsNotNone(native.process.poll())
+                self.assertFalse(os.path.exists(profile))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+if __name__ == "__main__":
+    unittest.main()
